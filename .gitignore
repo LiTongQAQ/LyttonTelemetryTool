@@ -1,0 +1,12 @@
+build/
+build-qt/
+dist/
+*.o
+*.dll
+*.zip
+*.f1tr
+*.f1map
+*.f1cal
+*.qmlproject.qtds
+recordings/
+!third_party/openvr/bin/win64/openvr_api.dll

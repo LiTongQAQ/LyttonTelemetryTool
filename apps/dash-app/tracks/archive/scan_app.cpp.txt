@@ -1,0 +1,117 @@
+// ARCHIVED, NOT COMPILED (2026-11-06). The track scan / calibration user interface, taken out of f1-race when the
+// maps switched to Track N Race's (third_party/track-n-race). Kept to be wired back in if scanning is wanted again.
+// The algorithms themselves are still built and tested: apps/dash-app/tracks/calib.* (library trackcal,
+// tool test_trackcal).
+//
+// To restore: the ui.cpp pages go back into apps/dash-app/race/ui.cpp (Page enum TRACKREC / TRACKCAL, PAGE_NAMES,
+// PAGE_HINTS, groups, the switch in the page dispatcher), the App members into app.hpp / app.cpp (the hub
+// subscriber feeds `scanner` while scanning; stopAll() calls stopScan(); updateTrack() loads mapPath() first), and
+// f1-race links trackcal again.
+
+// ==== app.hpp: members ====
+
+    // calibrated track maps (track-maps/<Track>.f1map) and the calibration data they come from (track-maps/data)
+    std::string mapsDir() const { return dir + "/track-maps"; }
+    std::string calDataDir() const { return dir + "/track-maps/data"; }
+    std::string mapPath(int trackId) const;
+    void reloadTrackMap(); // after a map file was made, imported or deleted
+
+    // track recording (the scan page): while scanning, every packet also goes into `scanner` (lock scanMx to read
+    // it); a recording is made alongside. stopScan() saves one data file per track and returns their paths. The
+    // scanner is kept after stopping, until the next start.
+    std::mutex scanMx;
+    std::unique_ptr<tracks::Scanner> scanner;
+    bool scanning() const { return scanning_; }
+    double scanSeconds() const;
+    void startScan();
+    std::vector<std::string> stopScan();
+    int mapGeneration() const { return mapGen_; }
+
+    // private:
+    int mapGen_ = 0;
+    std::atomic<bool> scanning_{false};
+    bool scanRecords_ = false; // the scan started the recording, so it stops it too
+    std::chrono::steady_clock::time_point scanT_;
+
+// ==== app.cpp: hub subscriber, while scanning ====
+
+        if (scanning_) {
+            std::lock_guard<std::mutex> l(scanMx);
+            if (scanner) scanner->feed(p, n);
+        }
+
+// ==== app.cpp: scan start / stop ====
+
+double App::scanSeconds() const
+{
+    return scanning_ ? std::chrono::duration<double>(std::chrono::steady_clock::now() - scanT_).count() : 0;
+}
+
+void App::startScan()
+{
+    if (scanning_) return;
+    scanRecords_ = canRecord() && !recording();
+    if (scanRecords_) startRecording();
+    const std::string name = recording() ? fs::path(recordingPath()).filename().string() : "scan-" + timestampName().substr(0, 15);
+    {
+        std::lock_guard<std::mutex> l(scanMx);
+        scanner = std::make_unique<tracks::Scanner>();
+        scanner->begin(name);
+    }
+    scanT_ = std::chrono::steady_clock::now();
+    scanning_ = true;
+    LOG("scan: start (%s)", name.c_str());
+}
+
+std::vector<std::string> App::stopScan()
+{
+    std::vector<std::string> saved;
+    if (!scanning_) return saved;
+    scanning_ = false;
+    if (scanRecords_) stopRecording();
+    scanRecords_ = false;
+    std::lock_guard<std::mutex> l(scanMx);
+    if (!scanner) return saved;
+    std::error_code ec;
+    fs::create_directories(calDataDir(), ec);
+    for (const auto &[id, d] : scanner->results()) {
+        if (!d.samples) continue;
+        const std::string p = calDataDir() + "/" + tracks::asciiName(id) + "_scan_" + timestampName().substr(0, 15) + ".f1cal";
+        std::string err;
+        if (tracks::saveData(d, p, &err)) saved.push_back(p);
+        LOG("scan: track %d, %llu positions, %zu edge points, %zu cells -> %s%s", id, (unsigned long long)d.samples,
+            d.edges.size(), d.grid.size(), p.c_str(), err.empty() ? "" : (" failed: " + err).c_str());
+    }
+    LOG("scan: stop");
+    return saved;
+}
+
+
+// ==== app.cpp: map files ====
+
+std::string App::mapPath(int trackId) const { return mapsDir() + "/" + tracks::asciiName(trackId) + ".f1map"; }
+
+void App::reloadTrackMap()
+{
+    trackId_ = -2; // the next update starts over and looks for the file again
+    trackFinal_ = false;
+    mapGen_++;
+}
+
+
+// ==== app.cpp: updateTrack(), first ====
+
+    // a map calibrated from recordings: in game coordinates already, nothing to fit
+    {
+        tracks::Geometry g;
+        std::string info;
+        if (tracks::loadMap(mapPath(si.trackId), g, nullptr, &info)) {
+            tracks::attachZones(g, si.trackId);
+            trackGeo = std::move(g);
+            trackStatus = trackGeo.name + (trackGeo.season ? " · " + std::to_string(trackGeo.season) + " 赛季" : "") + " · " +
+                          timing::sessionTypeName(si.sessionType) + " · 已配准（录像数据）";
+            trackFinal_ = true;
+            LOG("track: %s, calibrated map %s (%s)", trackGeo.name.c_str(), mapPath(si.trackId).c_str(), info.c_str());
+            return;
+        }
+    }

@@ -1,0 +1,2 @@
+module F1Data
+singleton Race 1.0 Race.qml

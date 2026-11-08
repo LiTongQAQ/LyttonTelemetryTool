@@ -1,0 +1,2 @@
+// Program icon (exe in Explorer, taskbar, window). Source: assets/brand/logo.ico
+1 ICON "../../../assets/brand/logo.ico"

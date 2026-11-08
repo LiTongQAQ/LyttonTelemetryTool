@@ -1,0 +1,16 @@
+import QmlProject
+
+Project {
+    mainFile: "content/App.qml"
+    mainUiFile: "content/MainView.ui.qml"
+
+    QmlFiles { directory: "content" }
+    QmlFiles { directory: "imports" }
+    Files { filter: "qmldir"; directory: "imports" }
+    Files { filter: "*.ttf;*.otf;*.png;*.svg"; directory: "assets" }
+
+    importPaths: [ "imports" ]
+    qt6Project: true
+    quickVersion: "6.8"
+    widgetApp: true
+}

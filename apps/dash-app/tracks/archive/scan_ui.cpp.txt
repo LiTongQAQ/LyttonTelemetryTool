@@ -1,0 +1,1095 @@
+// ARCHIVED, NOT COMPILED (2026-11-06). The track scan / calibration user interface, taken out of f1-race when the
+// maps switched to Track N Race's (third_party/track-n-race). Kept to be wired back in if scanning is wanted again.
+// The algorithms themselves are still built and tested: apps/dash-app/tracks/calib.* (library trackcal,
+// tool test_trackcal).
+//
+// To restore: the ui.cpp pages go back into apps/dash-app/race/ui.cpp (Page enum TRACKREC / TRACKCAL, PAGE_NAMES,
+// PAGE_HINTS, groups, the switch in the page dispatcher), the App members into app.hpp / app.cpp (the hub
+// subscriber feeds `scanner` while scanning; stopAll() calls stopScan(); updateTrack() loads mapPath() first), and
+// f1-race links trackcal again.
+
+// ==== ui.cpp: helper used by the track recording page ====
+
+// Opens Explorer with the file selected.
+void showFile(const std::string &path)
+{
+    const std::wstring args = L"/select,\"" + fs::path(path).make_preferred().wstring() + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// ==== ui.cpp: file pickers, calibration jobs, track recording page, map viewer, track calibration page ====
+
+std::vector<std::string> pickFiles(const std::string &dir, const wchar_t *filter, bool multi)
+{
+    std::vector<wchar_t> buf(1 << 16, 0);
+    fs::create_directories(dir);
+    const std::wstring wdir = fs::path(dir).wstring();
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof ofn;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = DWORD(buf.size());
+    ofn.lpstrInitialDir = wdir.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | (multi ? OFN_ALLOWMULTISELECT : 0);
+    std::vector<std::string> out;
+    if (!GetOpenFileNameW(&ofn)) return out;
+    // one file: the full path; several: the folder, then the names, each 0-terminated, ending with an empty one
+    const wchar_t *p = buf.data();
+    const std::wstring first = p;
+    p += first.size() + 1;
+    if (!*p) {
+        out.push_back(fs::path(first).string());
+        return out;
+    }
+    while (*p) {
+        const std::wstring name = p;
+        out.push_back((fs::path(first) / name).string());
+        p += name.size() + 1;
+    }
+    return out;
+}
+
+std::string pickSave(const std::string &suggested, const wchar_t *filter, const wchar_t *ext)
+{
+    wchar_t file[MAX_PATH] = L"";
+    const std::wstring name = fs::path(suggested).filename().wstring();
+    wcsncpy(file, name.c_str(), MAX_PATH - 1);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof ofn;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = ext;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return {};
+    return fs::path(file).string();
+}
+
+const wchar_t *const F_REC = L"F1 遥测录像 (*.f1tr)\0*.f1tr\0所有文件\0*.*\0";
+const wchar_t *const F_CAL = L"赛道配准数据 (*.f1cal)\0*.f1cal\0所有文件\0*.*\0";
+const wchar_t *const F_MAP = L"赛道配准结果 (*.f1map)\0*.f1map\0所有文件\0*.*\0";
+
+struct CalJob {
+    std::thread t;
+    std::atomic<bool> running{false};
+    std::atomic<bool> dataChanged{false}, mapChanged{false};
+    std::mutex m;
+    std::vector<std::string> log; // newest last
+    tracks::ExtractProgress prog;
+    std::string what;
+    void add(const std::string &s)
+    {
+        std::lock_guard<std::mutex> l(m);
+        log.push_back(s);
+        if (log.size() > 300) log.erase(log.begin());
+    }
+    ~CalJob()
+    {
+        prog.cancel = true;
+        if (t.joinable()) t.join();
+    }
+};
+CalJob g_cal;
+
+struct CalFile {
+    std::string path, name;
+    tracks::CalData d;
+    bool ok = false, selected = false;
+    std::string error;
+};
+std::vector<CalFile> g_calFiles;
+bool g_calScanned = false;
+
+struct MapFile {
+    std::string path, file, name, info;
+    int trackId = -1;
+    int kind = 0; // 0 current, 1 library
+    size_t points = 0, cells = 0, sources = 0;
+    int season = 0;
+    bool hasData = false, selected = false;
+};
+std::vector<MapFile> g_maps;
+
+std::string trackLabel(int id)
+{
+    const tracks::Shape *sh = tracks::forGame(id);
+    return sh ? sh->name : tracks::asciiName(id);
+}
+
+void scanCal(app::App &a)
+{
+    std::map<std::string, bool> sel;
+    for (const auto &f : g_calFiles) sel[f.path] = f.selected;
+    g_calFiles.clear();
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(a.calDataDir(), ec)) {
+        if (e.path().extension() != ".f1cal") continue;
+        CalFile f;
+        f.path = e.path().string();
+        f.name = e.path().filename().string();
+        f.ok = tracks::loadData(f.path, f.d, &f.error);
+        f.selected = sel.count(f.path) ? sel[f.path] : false;
+        g_calFiles.push_back(std::move(f));
+    }
+    std::sort(g_calFiles.begin(), g_calFiles.end(), [](const CalFile &x, const CalFile &y) {
+        return x.d.trackId != y.d.trackId ? x.d.trackId < y.d.trackId : x.name < y.name;
+    });
+    std::map<std::string, bool> mapSel;
+    for (const auto &m : g_maps) mapSel[m.path] = m.selected;
+    g_maps.clear();
+    auto addMap = [&](const std::string &path, const std::string &text, int kind) {
+        MapFile m;
+        m.path = path;
+        m.kind = kind;
+        tracks::Geometry g;
+        if (!tracks::parseMap(text, g, &m.trackId, &m.info, nullptr, &m.hasData) || m.trackId < 0) return;
+        m.name = g.name.empty() ? trackLabel(m.trackId) : g.name;
+        m.file = fs::path(path).filename().string();
+        m.points = g.cx.size();
+        m.cells = g.surface.size();
+        m.season = g.season;
+        const size_t end = std::min(text.size(), text.find("\ndata-begin"));
+        for (size_t at = text.find("\nsource "); at < end; at = text.find("\nsource ", at + 1)) m.sources++;
+        const std::string key = path;
+        m.selected = mapSel.count(key) && mapSel[key] && m.hasData;
+        g_maps.push_back(std::move(m));
+    };
+    auto readText = [](const fs::path &p) {
+        std::ifstream f(p, std::ios::binary);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    };
+    for (const char *dirName : {"", "/library"})
+        for (const auto &e : fs::directory_iterator(a.mapsDir() + dirName, ec))
+            if (e.path().extension() == ".f1map") addMap(e.path().string(), readText(e.path()), *dirName ? 1 : 0);
+    std::sort(g_maps.begin(), g_maps.end(), [](const MapFile &x, const MapFile &y) {
+        return x.trackId != y.trackId ? trackLabel(x.trackId) < trackLabel(y.trackId) : x.kind != y.kind ? x.kind < y.kind : x.file < y.file;
+    });
+    g_calScanned = true;
+}
+
+std::string stamp()
+{
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char b[32];
+    std::strftime(b, sizeof b, "%Y%m%d-%H%M%S", &tm);
+    return b;
+}
+
+void startJob(const char *what, std::function<void()> fn)
+{
+    if (g_cal.running) return;
+    if (g_cal.t.joinable()) g_cal.t.join();
+    g_cal.what = what;
+    g_cal.prog.filesDone = 0;
+    g_cal.prog.filesTotal = 0;
+    g_cal.prog.cancel = false;
+    g_cal.running = true;
+    g_cal.t = std::thread([fn] {
+        fn();
+        g_cal.running = false;
+    });
+}
+
+void startExtract(app::App &a, std::vector<std::string> files)
+{
+    const std::string out = a.calDataDir();
+    startJob("提取", [files, out] {
+        g_cal.add("提取：" + std::to_string(files.size()) + " 个录像");
+        std::vector<std::string> log;
+        auto sets = tracks::extract(files, &g_cal.prog, &log);
+        for (const auto &l : log) g_cal.add("  " + l);
+        std::error_code ec;
+        fs::create_directories(out, ec);
+        for (const auto &d : sets) {
+            size_t kerbs = d.edges.size();
+            const std::string path = out + "/" + tracks::asciiName(d.trackId) + "_" + stamp() + ".f1cal";
+            std::string err;
+            char b[200];
+            if (tracks::saveData(d, path, &err))
+                std::snprintf(b, sizeof b, "已生成 %s：%llu 个位置点，%zu 个路肩点，覆盖 %.0f%%",
+                              fs::path(path).filename().string().c_str(), (unsigned long long)d.samples, kerbs,
+                              d.coverage() * 100.f);
+            else
+                std::snprintf(b, sizeof b, "写入 %s 失败：%s", path.c_str(), err.c_str());
+            g_cal.add(b);
+            LOG("trackcal: %s", b);
+        }
+        if (sets.empty()) g_cal.add("录像里没有可用的位置数据（需要有车在赛道上跑的录像）");
+        g_cal.dataChanged = true;
+    });
+}
+
+void backupCurrent(app::App &a, int trackId);
+
+void startCalibrate(app::App &a, std::vector<tracks::CalData> sets)
+{
+    const std::string mapPath = a.mapPath(sets.front().trackId);
+    backupCurrent(a, sets.front().trackId);
+    startJob("配准", [sets, mapPath] {
+        tracks::CalData all;
+        for (const auto &d : sets) tracks::mergeData(all, d);
+        char b[200];
+        std::snprintf(b, sizeof b, "配准 %s：%zu 套数据，%llu 个位置点，%zu 个路肩点，覆盖 %.0f%%",
+                      trackLabel(all.trackId).c_str(), sets.size(), (unsigned long long)all.samples, all.edges.size(),
+                      all.coverage() * 100.f);
+        g_cal.add(b);
+        tracks::CalReport r;
+        tracks::Geometry g = tracks::calibrate(all, &r);
+        g_cal.add("  " + r.message);
+        LOG("trackcal: %s; %s", b, r.message.c_str());
+        if (!r.ok) return;
+        std::string err;
+        if (tracks::saveMap(g, all.trackId, r, all.sources, mapPath, &err, &all)) {
+            g_cal.add("  已保存配准结果 " + fs::path(mapPath).filename().string() + "，实时仪表和回放对比的地图会直接使用它");
+            g_cal.mapChanged = true;
+        } else {
+            g_cal.add("  保存配准结果失败：" + err);
+        }
+    });
+}
+
+// Moves the current map of a track into the library (before it is replaced).
+void backupCurrent(app::App &a, int trackId)
+{
+    std::error_code ec;
+    if (!fs::exists(a.mapPath(trackId))) return;
+    fs::create_directories(a.mapsDir() + "/library", ec);
+    const fs::path to = fs::path(a.mapsDir()) / "library" / (tracks::asciiName(trackId) + "_" + stamp() + ".f1map");
+    fs::rename(a.mapPath(trackId), to, ec);
+    if (!ec) g_cal.add("  原来的当前赛道图已移到地图库：" + to.filename().string());
+}
+
+// Merges the scan data of the chosen maps (same track) and calibrates again; the result is the track's current map.
+void startIntegrate(app::App &a, std::vector<const MapFile *> chosen)
+{
+    struct Src {
+        std::string path, file;
+        int trackId;
+    };
+    std::vector<Src> srcs;
+    for (const MapFile *m : chosen) srcs.push_back({m->path, m->file, m->trackId});
+    const int trackId = srcs.front().trackId;
+    const std::string mapPath = a.mapPath(trackId);
+    app::App *app = &a;
+    startJob("集成", [srcs, trackId, mapPath, app] {
+        tracks::CalData all;
+        for (const auto &s : srcs) {
+            std::ifstream f(fs::path(s.path), std::ios::binary);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            const std::string text = ss.str();
+            tracks::Geometry g;
+            tracks::CalData d;
+            bool has = false;
+            if (!tracks::parseMap(text, g, nullptr, nullptr, &d, &has) || !has) {
+                g_cal.add("  " + s.file + "：读不出扫描数据，跳过");
+                continue;
+            }
+            tracks::mergeData(all, d);
+            g_cal.add("  加入 " + s.file + "：" + std::to_string(d.sources.size()) + " 个录像，" + std::to_string(d.samples) + " 个位置点");
+        }
+        if (all.trackId < 0) { g_cal.add("集成失败：没有可用的扫描数据"); return; }
+        // the same recording in two of the maps (one of them integrated before) counts twice: say so
+        std::sort(all.sources.begin(), all.sources.end());
+        const auto dup = std::adjacent_find(all.sources.begin(), all.sources.end());
+        if (dup != all.sources.end())
+            g_cal.add("  注意：录像 " + *dup + " 在多张图里都有，它的数据被算了不止一次；集成时最好只选不重叠的图");
+        all.sources.erase(std::unique(all.sources.begin(), all.sources.end()), all.sources.end());
+        tracks::CalReport r;
+        tracks::Geometry g = tracks::calibrate(all, &r);
+        char b[200];
+        std::snprintf(b, sizeof b, "集成 %s：%zu 张图，合计 %zu 个录像、%llu 个位置点、路面格 %zu", trackLabel(trackId).c_str(),
+                      srcs.size(), all.sources.size(), (unsigned long long)all.samples, all.grid.size());
+        g_cal.add(b);
+        g_cal.add("  " + r.message);
+        LOG("trackcal: %s; %s", b, r.message.c_str());
+        if (!r.ok) return;
+        // (runs on the job thread: only file work here; the page rescans and reloads when mapChanged is seen)
+        std::error_code ec;
+        if (fs::exists(mapPath)) {
+            fs::create_directories(fs::path(mapPath).parent_path() / "library", ec);
+            const fs::path bak = fs::path(mapPath).parent_path() / "library" / (tracks::asciiName(trackId) + "_" + stamp() + ".f1map");
+            fs::rename(mapPath, bak, ec);
+            if (!ec) g_cal.add("  原来的当前赛道图已移到地图库：" + bak.filename().string());
+        }
+        std::string err;
+        if (tracks::saveMap(g, trackId, r, all.sources, mapPath, &err, &all)) {
+            g_cal.add("  已生成集成后的赛道图 " + fs::path(mapPath).filename().string() + "（设为当前使用，可导出发布）");
+            g_cal.mapChanged = true;
+        } else {
+            g_cal.add("  保存失败：" + err);
+        }
+        (void)app;
+    });
+}
+
+// ---- track recording ---------------------------------------------------------------------------------------------
+// A scan session: the live packets go into a tracks::Scanner while you drive along the track's edges; the page shows
+// what has been scanned, which stretches still lack a measured edge, and what is under the wheels now. Stopping
+// saves a data file; a map is then made from it (alone or integrated with the current map).
+struct ScanView {
+    tracks::Geometry geo; // the scanned cells so far (surface + runs only)
+    std::vector<std::array<float, 2>> binPos; // averaged position per 5 m, {NAN, NAN} where none
+    std::vector<uint8_t> binState;            // bits: 1 outer left, 2 outer right, 4 kerb left, 8 kerb right
+    int track = -1;
+    float length = 0;
+    uint64_t samples = 0;
+    size_t edges = 0, cls[tracks::S_CLASSES] = {};
+    tracks::Scanner::Player player;
+    std::chrono::steady_clock::time_point at;
+    bool have = false;
+};
+ScanView g_scanView;
+std::vector<std::string> g_scanSaved; // data files of the last scan
+bool g_scanFollow = true;
+bool g_scanOverlay = true; // the track's current map under the live scan
+
+void refreshScanView(app::App &a)
+{
+    std::lock_guard<std::mutex> l(a.scanMx);
+    auto &v = g_scanView;
+    v = {};
+    v.at = std::chrono::steady_clock::now();
+    if (!a.scanner) return;
+    auto &res = a.scanner->results();
+    v.player = a.scanner->player;
+    int id = a.scanner->trackId();
+    if (!res.count(id)) {
+        if (res.empty()) return;
+        id = res.begin()->first;
+    }
+    const auto &d = res[id];
+    v.have = true;
+    v.track = id;
+    v.length = d.trackLength;
+    v.samples = d.samples;
+    v.edges = d.edges.size();
+    v.geo.cell = tracks::CAL_CELL_M;
+    v.geo.surface.reserve(d.grid.size());
+    for (const auto &[key, c] : d.grid) {
+        int best = 0;
+        for (int k = 1; k < tracks::S_CLASSES; k++)
+            if (c[k] > c[best]) best = k;
+        v.cls[best]++;
+        v.geo.surface.push_back({int32_t(uint32_t(key >> 32)), int32_t(uint32_t(key)), uint8_t(best)});
+    }
+    tracks::buildSurfaceRuns(v.geo);
+    for (const auto &b : d.bins)
+        v.binPos.push_back(b.n ? std::array<float, 2>{float(b.sx / b.n), float(b.sz / b.n)} : std::array<float, 2>{NAN, NAN});
+    v.binState.assign(d.bins.size(), 0);
+    if (const auto *ec = a.scanner->edgeCounts(id))
+        for (size_t i = 0; i < ec->size() && i < v.binState.size(); i++)
+            v.binState[i] = uint8_t(((*ec)[i][4] ? 1 : 0) | ((*ec)[i][5] ? 2 : 0) | ((*ec)[i][2] ? 4 : 0) | ((*ec)[i][3] ? 8 : 0));
+}
+
+// Makes the current map of the track from the scan's data files, integrated with the current map's scan data (the
+// map file in use, or the built-in map) when `withCurrent`.
+void startScanMap(app::App &a, std::vector<std::string> files, bool withCurrent)
+{
+    if (files.empty()) return;
+    tracks::CalData first;
+    if (!tracks::loadData(files.front(), first)) { g_cal.add("读不了 " + files.front()); return; }
+    const int trackId = first.trackId;
+    const std::string mapPath = a.mapPath(trackId);
+    startJob("生成", [files, trackId, mapPath, withCurrent] {
+        tracks::CalData all;
+        for (const auto &f : files) {
+            tracks::CalData d;
+            if (tracks::loadData(f, d) && d.trackId == trackId) tracks::mergeData(all, d);
+        }
+        std::string with;
+        if (withCurrent) {
+            std::string text;
+            if (fs::exists(mapPath)) {
+                std::ifstream f(fs::path(mapPath), std::ios::binary);
+                std::stringstream ss;
+                ss << f.rdbuf();
+                text = ss.str();
+                with = fs::path(mapPath).filename().string();
+            }
+            tracks::Geometry g;
+            tracks::CalData d;
+            bool has = false;
+            if (!text.empty() && tracks::parseMap(text, g, nullptr, nullptr, &d, &has) && has) tracks::mergeData(all, d);
+            else with.clear();
+        }
+        char b[240];
+        std::snprintf(b, sizeof b, "生成 %s 赛道图：这次扫描%s%s，%llu 个位置点、%zu 个边缘点、路面格 %zu", trackLabel(trackId).c_str(),
+                      with.empty() ? "" : " + ", with.c_str(), (unsigned long long)all.samples, all.edges.size(), all.grid.size());
+        g_cal.add(b);
+        tracks::CalReport r;
+        tracks::Geometry g = tracks::calibrate(all, &r);
+        g_cal.add("  " + r.message);
+        LOG("trackscan: %s; %s", b, r.message.c_str());
+        if (!r.ok) return;
+        std::error_code ec;
+        if (fs::exists(mapPath)) {
+            fs::create_directories(fs::path(mapPath).parent_path() / "library", ec);
+            const fs::path bak = fs::path(mapPath).parent_path() / "library" / (tracks::asciiName(trackId) + "_" + stamp() + ".f1map");
+            fs::rename(mapPath, bak, ec);
+            if (!ec) g_cal.add("  原来的当前赛道图已移到地图库：" + bak.filename().string());
+        }
+        std::string err;
+        if (tracks::saveMap(g, trackId, r, all.sources, mapPath, &err, &all)) {
+            g_cal.add("  已生成赛道图 " + fs::path(mapPath).filename().string() + "（设为当前使用；“赛道配准”页可导出）");
+            g_cal.mapChanged = true;
+        } else {
+            g_cal.add("  保存失败：" + err);
+        }
+    });
+}
+
+void pageTrackRec(app::App &a)
+{
+    if (g_cal.mapChanged.exchange(false)) {
+        g_calScanned = false; // the track calibration page rescans
+        a.reloadTrackMap();
+    }
+    const bool scanning = a.scanning();
+    if (scanning ? std::chrono::steady_clock::now() - g_scanView.at > std::chrono::milliseconds(400) : !g_scanView.have && a.scanner)
+        refreshScanView(a);
+    const auto &v = g_scanView;
+    const float gap = 12;
+    const float W = ImGui::GetContentRegionAvail().x, H = ImGui::GetContentRegionAvail().y;
+    const float leftW = std::max(440.f, W * 0.36f), rightW = W - leftW - gap;
+    const bool busy = g_cal.running;
+
+    // edge coverage: share of the 5 m stretches with each kind of edge measured
+    size_t nb = v.binState.size(), cov[4] = {};
+    for (uint8_t s : v.binState)
+        for (int k = 0; k < 4; k++) cov[k] += (s >> k) & 1;
+    auto pct = [&](int k) { return nb ? 100.f * float(cov[k]) / float(nb) : 0.f; };
+
+    ImGui::BeginGroup();
+    beginScrollCard("scanctl", ImVec2(leftW, H * 0.56f), "扫描录制");
+    if (!scanning) {
+        ImGui::BeginDisabled(busy);
+        if (accentButton("开始扫描", ImVec2(160, 40))) {
+            a.startScan();
+            g_scanSaved.clear();
+            g_scanView = {};
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10);
+        if (a.source() == app::Source::Live) textCol(a.secondsSinceData() < 2 ? C_GREEN : C_DIM, a.secondsSinceData() < 2 ? "正在收到游戏数据" : "等待游戏数据");
+        else textCol(C_ORANGE, "当前数据源不是实时遥测");
+    } else {
+        if (accentButton("停止并保存", ImVec2(160, 40), C_RED)) {
+            g_scanSaved = a.stopScan();
+            refreshScanView(a);
+            if (g_scanSaved.empty()) g_cal.add("这次扫描没有记到赛道上的数据（车要在赛道上跑，不在维修区）");
+            for (const auto &p : g_scanSaved) g_cal.add("已保存扫描数据 " + fs::path(p).filename().string());
+            g_calScanned = false;
+        }
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6);
+        withFont(F->numMid, [&] { textCol(C_RED, "%s", app::formatDuration(a.scanSeconds()).c_str()); });
+    }
+    ImGui::Spacing();
+    if (v.have) {
+        textCol(C_TEXT, "%s", trackLabel(v.track).c_str());
+        ImGui::SameLine();
+        textCol(C_DIM, "  %.0f m · 位置点 %llu · 边缘点 %zu", v.length, (unsigned long long)v.samples, v.edges);
+        textCol(C_DIM, "扫描格（0.5 m）：沥青 %zu · 路肩 %zu · 草地 %zu · 碎石沙地 %zu · 水泥等 %zu", v.cls[tracks::S_TARMAC],
+                v.cls[tracks::S_KERB], v.cls[tracks::S_GRASS], v.cls[tracks::S_GRAVEL], v.cls[tracks::S_HARD]);
+        ImGui::Spacing();
+        // edge coverage bars
+        const char *names[4] = {"左侧外沿（压到草地 / 碎石）", "右侧外沿（压到草地 / 碎石）", "左侧路肩内沿", "右侧路肩内沿"};
+        for (int k : {0, 1, 2, 3}) {
+            const float p = pct(k);
+            ImGui::TextUnformatted(names[k]);
+            ImGui::SameLine(leftW - 90);
+            textCol(p > 80 ? C_GREEN : p > 40 ? C_YELLOW : C_DIM, "%3.0f%%", p);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, v4(k < 2 ? C_GREEN : C_RED));
+            ImGui::ProgressBar(p / 100.f, ImVec2(-1, 6), "");
+            ImGui::PopStyleColor();
+        }
+        textCol(alpha(C_DIM, 0.8f), "每 5 m 一段，有一个实测点就算覆盖；外沿是生成地图边缘最需要的数据");
+    } else if (scanning) {
+        textCol(C_DIM, "等待赛道上的数据：进入赛道（出维修区）后开始记录");
+    } else {
+        textCol(C_DIM, "还没有扫描。开始后照下面的方法开，录完点“停止并保存”");
+    }
+
+    // what is under the wheels now, and the next stretch that still lacks an outer edge
+    if (scanning && v.player.valid) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        textCol(C_DIM, "现在：%.0f km/h · %s", v.player.speed, v.player.onTrack ? "在赛道上" : "不在赛道上（维修区 / 车库，不记录）");
+        const char *wheel[4] = {"左后", "右后", "左前", "右前"};
+        for (int row : {2, 0}) { // front axle, then rear
+            for (int w : {row, row + 1}) {
+                const uint8_t s = v.player.surf[w];
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + 12, p.y + 16),
+                                                          SURF_COL[tracks::surfaceClassOf(s)], 2);
+                ImGui::Dummy(ImVec2(14, 16));
+                ImGui::SameLine();
+                ImGui::Text("%s %s", wheel[w], surfaceName(s));
+                if (w == row) ImGui::SameLine(160);
+            }
+        }
+        if (v.player.onTrack && nb) {
+            const size_t me = std::min(nb - 1, size_t(std::max(0.f, v.player.dist) / tracks::CAL_BIN_M));
+            for (int side : {0, 1}) {
+                size_t k = 0;
+                while (k < 60 && (v.binState[(me + k) % nb] >> side & 1)) k++;
+                if (k < 60) textCol(C_YELLOW, "%s外沿：前方 %zu m 起还没压到", side ? "右侧" : "左侧", k * 5);
+                else textCol(C_GREEN, "%s外沿：前方 300 m 都已覆盖", side ? "右侧" : "左侧");
+            }
+        }
+    }
+    endCard();
+
+    ImGui::Dummy(ImVec2(0, gap - 4));
+    beginScrollCard("scanhow", ImVec2(leftW, H * 0.44f - gap), "怎么录");
+    if (!g_scanSaved.empty() && !scanning) {
+        textCol(C_GREEN, "已保存 %zu 个扫描数据文件，现在生成地图：", g_scanSaved.size());
+        ImGui::BeginDisabled(busy);
+        if (accentButton("与当前地图集成后生成")) startScanMap(a, g_scanSaved, true);
+        ImGui::SameLine();
+        if (ImGui::Button("只用这次扫描生成")) startScanMap(a, g_scanSaved, false);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("打开数据文件夹")) openFolder(a.calDataDir());
+        if (busy) textCol(C_YELLOW, "正在生成…");
+        {
+            std::lock_guard<std::mutex> l(g_cal.m);
+            for (size_t i = g_cal.log.size() > 4 ? g_cal.log.size() - 4 : 0; i < g_cal.log.size(); i++)
+                ImGui::TextWrapped("%s", g_cal.log[i].c_str());
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+    if (g_scanSaved.empty() || scanning) { // the latest messages (a map loaded ...)
+        std::lock_guard<std::mutex> l(g_cal.m);
+        for (size_t i = g_cal.log.size() > 2 ? g_cal.log.size() - 2 : 0; i < g_cal.log.size(); i++)
+            textCol(C_DIM, "%s", g_cal.log[i].c_str());
+        if (!g_cal.log.empty()) ImGui::Separator();
+    }
+    ImGui::BulletText("计时赛或离线练习赛，赛道上只有你一辆车；游戏 UDP 发送频率 60 Hz");
+    ImGui::BulletText("贴着左侧边缘开一圈、右侧边缘开一圈（各两圈更好），30～60 km/h");
+    ImGui::BulletText("画龙：外侧车轮压过路肩、压进草地或碎石一点，再回到沥青");
+    ImGui::BulletText("看右边地图上的赛道点：绿 = 两侧外沿都测到，黄 = 只有一侧，灰 = 都没有");
+    ImGui::BulletText("进出维修区不影响，维修区里的数据不记录；同时会录一份普通录像");
+    ImGui::BulletText("停止后点“与当前地图集成后生成”，结果是这条赛道的当前地图");
+    endCard();
+    ImGui::EndGroup();
+
+    // the live map
+    ImGui::SameLine(0, gap);
+    beginCard("scanmap", ImVec2(rightW, H), nullptr);
+    ImGui::Checkbox("跟随车辆", &g_scanFollow);
+    ImGui::SameLine();
+    ImGui::Checkbox("叠加当前地图", &g_scanOverlay);
+    ImGui::SameLine();
+    {
+        // the map file of the track being scanned (or the last one the dashboard loaded)
+        const int tid = v.have ? v.track : a.race.snapshot().session.trackId;
+        const std::string mp = tid >= 0 ? a.mapPath(tid) : std::string();
+        const bool exists = !mp.empty() && fs::exists(mp);
+        if (ImGui::SmallButton("查看地图文件")) {
+            if (exists) showFile(mp);
+            else openFolder(a.mapsDir());
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", exists ? mp.c_str()
+                                           : "这条赛道还没有地图文件，打开地图文件夹");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_cal.running);
+    if (ImGui::SmallButton("打开地图文件…")) {
+        // load a map file: it becomes its track's current map (the one in use moves to the library)
+        const auto files = pickFiles(a.mapsDir(), F_MAP, false);
+        if (!files.empty()) {
+            const std::string p = files.front();
+            tracks::Geometry g;
+            int id = -1;
+            std::error_code ec;
+            if (!tracks::loadMap(p, g, &id) || id < 0) {
+                g_cal.add(fs::path(p).filename().string() + "：不是赛道图文件");
+            } else if (fs::equivalent(p, a.mapPath(id), ec)) {
+                a.reloadTrackMap();
+                g_cal.add("已重新加载 " + trackLabel(id) + " 的当前地图");
+            } else {
+                backupCurrent(a, id);
+                fs::create_directories(a.mapsDir(), ec);
+                fs::copy_file(p, a.mapPath(id), fs::copy_options::overwrite_existing, ec);
+                g_cal.add("已加载 " + fs::path(p).filename().string() + "，设为" + trackLabel(id) + "的当前地图" +
+                          (ec ? "（复制失败：" + ec.message() + "）" : ""));
+                LOG("trackscan: loaded map %s as current for track %d%s", p.c_str(), id, ec ? " (copy failed)" : "");
+                g_calScanned = false;
+                a.reloadTrackMap();
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("选一个 .f1map 文件，设为它那条赛道的当前地图并立即加载；原来的当前地图移到地图库");
+    ImGui::SameLine();
+    textCol(C_DIM, "  灰色 = 已扫描沥青，红 = 路肩，绿 = 草地，土黄 = 碎石沙地");
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetCursorScreenPos(), av = ImGui::GetContentRegionAvail();
+    dl->PushClipRect(o, ImVec2(o.x + av.x, o.y + av.y), true);
+    float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+    for (const auto &p : v.binPos)
+        if (!std::isnan(p[0])) { x0 = std::min(x0, p[0]); x1 = std::max(x1, p[0]); z0 = std::min(z0, p[1]); z1 = std::max(z1, p[1]); }
+    const bool follow = g_scanFollow && v.player.valid;
+    if (follow) { // 160 m around the car
+        x0 = v.player.x - 80; x1 = v.player.x + 80; z0 = v.player.z - 80; z1 = v.player.z + 80;
+    }
+    if (x1 > x0) {
+        const float k = std::min(av.x / (x1 - x0 + 40), av.y / (z1 - z0 + 40));
+        const float cxw = (x0 + x1) / 2, czw = (z0 + z1) / 2, midX = o.x + av.x / 2, midY = o.y + av.y / 2;
+        auto map = [&](float x, float z) { return ImVec2(midX + (x - cxw) * k, midY + (czw - z) * k); };
+        // the averaged line as dots: edge coverage
+        for (size_t i = 0; i < v.binPos.size(); i++) {
+            if (std::isnan(v.binPos[i][0])) continue;
+            const uint8_t s = v.binState[i] & 3;
+            const ImU32 c = s == 3 ? C_GREEN : s ? C_YELLOW : alpha(C_DIM, 0.6f);
+            dl->AddCircleFilled(map(v.binPos[i][0], v.binPos[i][1]), follow ? 5.f : 2.5f, alpha(c, 0.35f));
+        }
+        if (g_scanOverlay && a.trackGeo.ok && (!a.trackGeo.runs.empty() || !a.trackGeo.bands.empty())) { // the current map, faded, under the scan
+            drawSurface(dl, a.trackGeo, map, k, o, ImVec2(o.x + av.x, o.y + av.y));
+            drawKerbs(dl, a.trackGeo, map);
+            drawEdges(dl, a.trackGeo, map);
+            dl->AddRectFilled(o, ImVec2(o.x + av.x, o.y + av.y), alpha(C_PANEL, 0.55f));
+        }
+        drawSurface(dl, v.geo, map, k, o, ImVec2(o.x + av.x, o.y + av.y));
+        if (v.player.valid) {
+            const ImVec2 pp = map(v.player.x, v.player.z), ahead = map(v.player.x + v.player.fx, v.player.z + v.player.fz);
+            dl->AddCircleFilled(pp, 11, alpha(IM_COL32_WHITE, 0.18f));
+            carMarker(dl, pp, ImVec2(ahead.x - pp.x, ahead.y - pp.y), 8, IM_COL32_WHITE, C_ACCENT);
+        }
+    } else {
+        dl->AddText(ImVec2(o.x + 20, o.y + 20), C_DIM, "扫描开始后，这里实时显示扫到的路面");
+    }
+    dl->PopClipRect();
+    endCard();
+}
+
+// ---- map viewer: one map file at full size (scan, fitted kerbs, switch points, edges); wheel zooms, drag pans
+struct MapViewer {
+    bool open = false;
+    std::string title;
+    tracks::Geometry geo;  // the map
+    bool full = false;     // a full map: its scan data below
+    tracks::Geometry scan; // the scanned cells (no inferred ones), as a surface
+    std::vector<tracks::CalEdge> edges;
+    std::vector<std::array<float, 2>> pos; // car position samples
+    // layers
+    bool showFit = true, showScan = false, showSwitch = true, showEdge = false, showPos = false;
+    float zoom = 1;
+    ImVec2 pan{0, 0}; // world offset of the view centre from the map's centre, m
+} g_viewer;
+
+void openMapViewer(const MapFile &m)
+{
+    tracks::Geometry g;
+    tracks::CalData d;
+    bool has = false;
+    if (!tracks::loadMap(m.path, g, nullptr, nullptr, &d, &has)) { g_cal.add(m.file + "：读不出赛道图"); return; }
+    auto &v = g_viewer;
+    v.geo = std::move(g);
+    v.full = has;
+    v.scan = {};
+    v.edges.clear();
+    v.pos.clear();
+    if (has) {
+        v.scan.cell = tracks::CAL_CELL_M;
+        for (const auto &[key, c] : d.grid) {
+            int best = 0, total = 0;
+            for (int k = 0; k < tracks::S_CLASSES; k++) {
+                total += c[k];
+                if (c[k] > c[best]) best = k;
+            }
+            if (total >= 2) v.scan.surface.push_back({int32_t(uint32_t(key >> 32)), int32_t(uint32_t(key)), uint8_t(best)});
+        }
+        tracks::buildSurfaceRuns(v.scan);
+        v.edges = std::move(d.edges);
+        for (const auto &bin : d.pos) v.pos.insert(v.pos.end(), bin.begin(), bin.end());
+    }
+    v.showScan = v.showEdge = v.showPos = false;
+    v.showFit = v.showSwitch = true;
+    v.title = trackLabel(m.trackId) + " · " + m.file + (has ? " · 完整地图" : " · 2D 简图");
+    v.zoom = 1;
+    v.pan = ImVec2(0, 0);
+    v.open = true;
+}
+
+void mapViewerWindow()
+{
+    auto &v = g_viewer;
+    if (!v.open) return;
+    ImGui::OpenPopup("赛道地图");
+    const ImVec2 vs = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowSize(ImVec2(vs.x * 0.9f, vs.y * 0.9f), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(vs.x * 0.5f, vs.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("赛道地图", &v.open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
+        return;
+    const auto &geo = v.geo;
+    ImGui::TextUnformatted(v.title.c_str());
+    ImGui::SameLine();
+    textCol(C_DIM, "  滚轮缩放 · 拖动平移 · 双击全图");
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 60);
+    if (ImGui::Button("关闭")) { v.open = false; ImGui::CloseCurrentPopup(); }
+    // layers: the fitted map, and (full maps) the scan data it was made from
+    constexpr ImU32 COL_OUT = IM_COL32(90, 220, 255, 230), COL_RIDE = IM_COL32(230, 120, 255, 200);
+    constexpr ImU32 COL_POS = IM_COL32(200, 205, 215, 90);
+    ImGui::Checkbox("拟合地图", &v.showFit);
+    ImGui::SameLine();
+    ImGui::Checkbox("路肩切换点", &v.showSwitch);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!v.full);
+    ImGui::Checkbox("扫描路面格", &v.showScan);
+    ImGui::SameLine();
+    ImGui::Checkbox("车轮边缘点", &v.showEdge);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("青色：压出赛道（到草地 / 碎石）的位置；紫色：压在路肩上；黄色：沥青和路肩的切换");
+    ImGui::SameLine();
+    ImGui::Checkbox("车辆位置", &v.showPos);
+    ImGui::EndDisabled();
+    if (!v.full) {
+        ImGui::SameLine();
+        textCol(C_DIM, "  2D 简图不含扫描数据");
+    } else {
+        ImGui::SameLine();
+        textCol(C_DIM, "  扫描格 %zu · 边缘点 %zu · 位置 %zu", v.scan.surface.size(), v.edges.size(), v.pos.size());
+    }
+    const ImVec2 o = ImGui::GetCursorScreenPos(), av = ImGui::GetContentRegionAvail();
+    ImGui::InvisibleButton("##view", av);
+    const bool hov = ImGui::IsItemHovered();
+    float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+    for (size_t i = 0; i < geo.cx.size(); i++) {
+        for (float x : {geo.lx[i], geo.rx[i]}) { x0 = std::min(x0, x); x1 = std::max(x1, x); }
+        for (float z : {geo.lz[i], geo.rz[i]}) { z0 = std::min(z0, z); z1 = std::max(z1, z); }
+    }
+    if (x1 > x0) {
+        const float k0 = std::min(av.x / (x1 - x0 + 60), av.y / (z1 - z0 + 60)), k = k0 * v.zoom;
+        const float cxw = (x0 + x1) / 2 + v.pan.x, czw = (z0 + z1) / 2 + v.pan.y;
+        const float midX = o.x + av.x / 2, midY = o.y + av.y / 2;
+        auto map = [&](float x, float z) { return ImVec2(midX + (x - cxw) * k, midY + (czw - z) * k); };
+        if (hov) {
+            const ImGuiIO &io = ImGui::GetIO();
+            if (io.MouseWheel != 0) { // zoom about the mouse
+                const float wx = cxw + (io.MousePos.x - midX) / k, wz = czw - (io.MousePos.y - midY) / k;
+                v.zoom = std::clamp(v.zoom * (io.MouseWheel > 0 ? 1.25f : 0.8f), 1.f, 400.f);
+                const float k2 = k0 * v.zoom;
+                v.pan.x = wx - (io.MousePos.x - midX) / k2 - (x0 + x1) / 2;
+                v.pan.y = wz + (io.MousePos.y - midY) / k2 - (z0 + z1) / 2;
+            }
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                v.pan.x -= io.MouseDelta.x / k;
+                v.pan.y += io.MouseDelta.y / k;
+            }
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { v.zoom = 1; v.pan = ImVec2(0, 0); }
+        }
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 c1(o.x + av.x, o.y + av.y);
+        auto visible = [&](ImVec2 p) { return p.x >= o.x && p.x <= c1.x && p.y >= o.y && p.y <= c1.y; };
+        dl->PushClipRect(o, c1, true);
+        dl->AddRectFilled(o, c1, C_PANEL);
+        const bool fitted = !geo.runs.empty() || !geo.bands.empty();
+        if (v.showFit) {
+            if (!fitted) drawOutline(dl, geo, map);
+            drawSurface(dl, geo, map, k, o, c1);
+            if (fitted) drawKerbs(dl, geo, map);
+        }
+        if (v.showScan && v.full) {
+            if (v.showFit) dl->AddRectFilled(o, c1, alpha(C_PANEL, 0.6f)); // the scan over a faded map
+            drawSurface(dl, v.scan, map, k, o, c1);
+        }
+        if (v.showFit && fitted) drawEdges(dl, geo, map);
+        if (v.showPos && v.full)
+            for (const auto &p : v.pos)
+                if (const ImVec2 q = map(p[0], p[1]); visible(q)) dl->AddRectFilled(q, ImVec2(q.x + 1.5f, q.y + 1.5f), COL_POS);
+        if (v.showEdge && v.full)
+            for (const auto &e : v.edges) {
+                const ImVec2 q = map(e.x, e.z);
+                if (!visible(q) || e.kind == 'I') continue; // the tarmac <-> kerb crossings: the switch points layer
+                dl->AddCircleFilled(q, 1.8f, e.kind == 'O' ? COL_OUT : COL_RIDE, 6);
+            }
+        if (v.showSwitch)
+            for (const auto &s : geo.switches)
+                if (const ImVec2 q = map(s[0], s[1]); visible(q)) dl->AddCircleFilled(q, 1.8f, IM_COL32(255, 220, 90, 220), 6);
+        surfaceLegend(dl, geo, ImVec2(o.x + 10, c1.y - ImGui::GetTextLineHeight() - 10), true);
+        char b[64];
+        std::snprintf(b, sizeof b, "%.1fx", v.zoom);
+        dl->AddText(ImVec2(o.x + 10, o.y + 8), C_DIM, b);
+        dl->PopClipRect();
+    }
+    ImGui::EndPopup();
+}
+
+void pageTrackCal(app::App &a)
+{
+    if (!g_calScanned || g_cal.dataChanged.exchange(false)) scanCal(a);
+    if (g_cal.mapChanged.exchange(false)) {
+        scanCal(a);
+        a.reloadTrackMap();
+    }
+    const float gap = 12;
+    const float W = ImGui::GetContentRegionAvail().x, H = ImGui::GetContentRegionAvail().y;
+    const float leftW = std::max(560.f, W * 0.52f), rightW = W - leftW - gap;
+    const bool busy = g_cal.running;
+
+    ImGui::BeginGroup();
+    // 1. extract
+    beginCard("calx", ImVec2(leftW, 190), "1. 从录像提取配准数据");
+    ImGui::TextWrapped("选一个或多个录像（你的、朋友的都行），按赛道各生成一个配准数据文件。只用在赛道上的车：维修区、车库里的车不算；"
+                       "轮子压上路肩的位置记为赛道边缘的实测点。");
+    ImGui::Spacing();
+    ImGui::BeginDisabled(busy);
+    if (accentButton("选择录像…")) {
+        auto files = pickFiles(a.recordingsDir(), F_REC, true);
+        if (!files.empty()) startExtract(a, files);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (busy && g_cal.what == "提取") {
+        textCol(C_YELLOW, "正在读取录像 %d / %d", g_cal.prog.filesDone.load(), g_cal.prog.filesTotal.load());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("停止")) g_cal.prog.cancel = true;
+    }
+    endCard();
+
+    // 2. calibrate from data files
+    beginScrollCard("calc", ImVec2(leftW, H - 190 - gap), "2. 用配准数据配准（可选多套，同一条赛道）");
+    ImGui::BeginDisabled(busy);
+    std::vector<tracks::CalData> chosen;
+    int track = -1;
+    bool mixed = false;
+    for (const auto &f : g_calFiles)
+        if (f.selected && f.ok) {
+            if (track >= 0 && f.d.trackId != track) mixed = true;
+            track = f.d.trackId;
+            chosen.push_back(f.d);
+        }
+    if (accentButton("用选中的数据配准") && !chosen.empty() && !mixed) startCalibrate(a, chosen);
+    ImGui::SameLine();
+    if (ImGui::Button("导入数据文件…")) {
+        for (const auto &p : pickFiles(a.calDataDir(), F_CAL, true)) {
+            tracks::CalData d;
+            std::string err;
+            std::error_code ec;
+            if (!tracks::loadData(p, d, &err)) { g_cal.add(fs::path(p).filename().string() + "：" + err); continue; }
+            fs::create_directories(a.calDataDir(), ec);
+            fs::copy_file(p, fs::path(a.calDataDir()) / fs::path(p).filename(), fs::copy_options::overwrite_existing, ec);
+            g_cal.add("已导入数据文件 " + fs::path(p).filename().string() + (ec ? "（复制失败：" + ec.message() + "）" : ""));
+        }
+        scanCal(a);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("打开数据文件夹")) openFolder(a.calDataDir());
+    ImGui::SameLine();
+    if (ImGui::Button("刷新")) scanCal(a);
+    ImGui::EndDisabled();
+    if (busy && g_cal.what == "配准") textCol(C_YELLOW, "正在配准…");
+    else if (mixed) textCol(C_ORANGE, "选中的数据不是同一条赛道，一次只能配准一条赛道");
+    else if (chosen.empty()) textCol(C_DIM, "勾选下面的数据文件后配准；多套数据会先合并");
+    else {
+        tracks::CalData all;
+        for (const auto &d : chosen) tracks::mergeData(all, d);
+        textCol(C_DIM, "%s：%zu 套，合计 %llu 个位置点、%zu 个路肩点、覆盖 %.0f%%", trackLabel(track).c_str(), chosen.size(),
+                (unsigned long long)all.samples, all.edges.size(), all.coverage() * 100.f);
+    }
+    ImGui::Spacing();
+    if (g_calFiles.empty()) textCol(alpha(C_DIM, 0.7f), "还没有配准数据，先在上面从录像提取");
+    int lastTrack = -2;
+    for (size_t i = 0; i < g_calFiles.size(); i++) {
+        auto &f = g_calFiles[i];
+        ImGui::PushID(int(i));
+        if (f.ok && f.d.trackId != lastTrack) {
+            lastTrack = f.d.trackId;
+            ImGui::SeparatorText(trackLabel(f.d.trackId).c_str());
+        }
+        ImGui::BeginDisabled(!f.ok || busy);
+        ImGui::Checkbox(f.name.c_str(), &f.selected);
+        ImGui::EndDisabled();
+        if (f.ok) {
+            ImGui::SameLine();
+            textCol(C_DIM, "位置点 %llu · 路肩点 %zu · 覆盖 %.0f%% · 来自 %zu 个录像", (unsigned long long)f.d.samples,
+                    f.d.edges.size(), f.d.coverage() * 100.f, f.d.sources.size());
+            if (ImGui::IsItemHovered() && !f.d.sources.empty()) {
+                std::string s;
+                for (const auto &x : f.d.sources) s += x + "\n";
+                ImGui::SetTooltip("%s", s.c_str());
+            }
+        } else {
+            ImGui::SameLine();
+            textCol(C_RED, "%s", f.error.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(busy);
+        if (ImGui::SmallButton("删除")) {
+            std::error_code ec;
+            fs::remove(f.path, ec);
+            g_cal.add("已删除数据文件 " + f.name);
+            ImGui::EndDisabled();
+            ImGui::PopID();
+            scanCal(a);
+            break;
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+    endCard();
+    ImGui::EndGroup();
+
+    ImGui::SameLine(0, gap);
+    ImGui::BeginGroup();
+    // maps: the current one per track, the library (imported, replaced), the built-in ones
+    beginScrollCard("calm", ImVec2(rightW, H * 0.5f), "赛道图（当前使用 / 地图库）：勾选同一条赛道的几张完整地图可集成");
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("导入赛道图…")) {
+        std::error_code ec;
+        fs::create_directories(a.mapsDir() + "/library", ec);
+        for (const auto &p : pickFiles(a.mapsDir(), F_MAP, true)) {
+            tracks::Geometry g;
+            int id = -1;
+            if (!tracks::loadMap(p, g, &id) || id < 0) { g_cal.add(fs::path(p).filename().string() + "：不是赛道图文件"); continue; }
+            // into the library under its own name (never over another map)
+            fs::path to = fs::path(a.mapsDir()) / "library" / fs::path(p).filename();
+            for (int k = 2; fs::exists(to); k++)
+                to = fs::path(a.mapsDir()) / "library" / (fs::path(p).stem().string() + "_" + std::to_string(k) + ".f1map");
+            fs::copy_file(p, to, ec);
+            std::string msg = "已导入 " + trackLabel(id) + " 的赛道图到地图库：" + to.filename().string();
+            if (!ec && !fs::exists(a.mapPath(id))) { // no current map for this track yet: use it
+                fs::copy_file(to, a.mapPath(id), ec);
+                msg += "，并设为当前使用";
+            }
+            g_cal.add(msg + (ec ? "（复制失败：" + ec.message() + "）" : ""));
+        }
+        scanCal(a);
+        a.reloadTrackMap();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("打开文件夹")) openFolder(a.mapsDir());
+    ImGui::SameLine();
+    {
+        std::vector<const MapFile *> sel;
+        int track = -1;
+        bool mixed = false;
+        for (const auto &m : g_maps)
+            if (m.selected) {
+                if (track >= 0 && m.trackId != track) mixed = true;
+                track = m.trackId;
+                sel.push_back(&m);
+            }
+        ImGui::BeginDisabled(sel.size() < 2 || mixed);
+        if (accentButton("集成选中的赛道图")) startIntegrate(a, sel);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (mixed) textCol(C_ORANGE, "不是同一条赛道");
+        else if (sel.size() == 1) textCol(C_DIM, "再选一张同一条赛道的图");
+        else if (sel.size() >= 2) textCol(C_DIM, "%s：%zu 张", trackLabel(track).c_str(), sel.size());
+    }
+    ImGui::EndDisabled();
+    if (busy && g_cal.what == "集成") textCol(C_YELLOW, "正在集成…");
+    ImGui::Spacing();
+    if (g_maps.empty()) textCol(alpha(C_DIM, 0.7f), "还没有赛道图；没有图的赛道，地图继续用现场对准");
+    int lastMapTrack = -2;
+    const char *kinds[2] = {"当前使用", "地图库"};
+    const ImU32 kindCol[2] = {C_GREEN, C_DIM};
+    for (size_t i = 0; i < g_maps.size(); i++) {
+        auto &m = g_maps[i];
+        ImGui::PushID(int(1000 + i));
+        if (m.trackId != lastMapTrack) {
+            lastMapTrack = m.trackId;
+            ImGui::SeparatorText(trackLabel(m.trackId).c_str());
+        }
+        ImGui::BeginDisabled(busy || !m.hasData);
+        ImGui::Checkbox("##sel", &m.selected);
+        ImGui::EndDisabled();
+        if (!m.hasData && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("这张图不带扫描数据（旧版本生成），不能集成");
+        ImGui::SameLine();
+        textCol(kindCol[m.kind], "[%s]", kinds[m.kind]);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(m.file.c_str());
+        ImGui::SameLine();
+        textCol(C_DIM, "%s%zu 个录像 · 路面格 %zu%s", m.season ? (std::to_string(m.season) + " 赛季 · ").c_str() : "赛季未知 · ",
+                m.sources, m.cells, m.hasData ? "" : " · 无扫描数据");
+        ImGui::PushTextWrapPos(0);
+        textCol(alpha(C_DIM, 0.8f), "%s", m.info.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::SmallButton(m.hasData ? "查看完整地图" : "查看")) openMapViewer(m);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(busy);
+        if (ImGui::SmallButton("导出…")) {
+            const std::string to = pickSave(tracks::asciiName(m.trackId) + ".f1map", F_MAP, L"f1map");
+            if (!to.empty()) {
+                std::error_code ec;
+                fs::copy_file(m.path, to, fs::copy_options::overwrite_existing, ec);
+                g_cal.add("已导出 " + trackLabel(m.trackId) + " 的完整地图到 " + to + (ec ? "（失败：" + ec.message() + "）" : ""));
+            }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("整张图连同扫描数据：可以再集成、再生成。只给一起建图的人");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("导出 2D 简图…")) {
+            const std::string to = pickSave(tracks::asciiName(m.trackId) + "_2D.f1map", F_MAP, L"f1map");
+            tracks::Geometry g;
+            std::string err;
+            if (!to.empty()) {
+                const bool ok = tracks::loadMap(m.path, g) && tracks::saveDisplayMap(g, m.trackId, to, &err);
+                g_cal.add("已导出 " + trackLabel(m.trackId) + " 的 2D 简图到 " + to + (ok ? "" : "（失败：" + err + "）"));
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("只有边缘、路肩和各区域的类型，够做 2D 复盘；不含扫描数据，拿到的人不能用它集成或重建");
+        bool changed = false;
+        if (m.kind == 1) { // library: make it the current map
+            ImGui::SameLine();
+            if (ImGui::SmallButton("设为当前")) {
+                backupCurrent(a, m.trackId);
+                std::error_code ec;
+                fs::copy_file(m.path, a.mapPath(m.trackId), fs::copy_options::overwrite_existing, ec);
+                g_cal.add("已把 " + m.file + " 设为 " + trackLabel(m.trackId) + " 的当前赛道图" + (ec ? "（失败：" + ec.message() + "）" : ""));
+                changed = true;
+            }
+        }
+        {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("删除")) {
+                std::error_code ec;
+                fs::remove(m.path, ec);
+                g_cal.add("已删除 " + m.file + (m.kind == 0 ? "；这条赛道改用现场对准" : ""));
+                changed = true;
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        if (changed) {
+            scanCal(a);
+            a.reloadTrackMap();
+            break;
+        }
+    }
+    endCard();
+
+    mapViewerWindow();
+
+    // log
+    beginScrollCard("call", ImVec2(rightW, H - H * 0.5f - gap), "运行记录");
+    {
+        std::lock_guard<std::mutex> l(g_cal.m);
+        ImGui::PushTextWrapPos(0);
+        for (const auto &s : g_cal.log) textCol(s.rfind("  ", 0) == 0 ? C_DIM : C_TEXT, "%s", s.c_str());
+        ImGui::PopTextWrapPos();
+        static size_t seen = 0;
+        if (g_cal.log.size() != seen) {
+            seen = g_cal.log.size();
+            ImGui::SetScrollHereY(1.f);
+        }
+    }
+    endCard();
+    ImGui::EndGroup();
+}
+

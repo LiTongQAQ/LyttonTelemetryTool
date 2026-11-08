@@ -1,0 +1,27 @@
+F1 Race 遥测工作站
+
+本程序是自由软件，按 GNU 通用公共许可证第 3 版（GPL-3.0）发布：可以自由使用、复制、修改和再发布，
+再发布（包括修改后的版本）时须同样以 GPL-3.0 提供源代码。本程序不提供任何担保。许可证全文见安装目录的 LICENSE。
+
+本程序只读取 EA《F1 25》通过官方 UDP 遥测功能发出的数据，不注入游戏、不修改游戏文件。
+使用前请在游戏的“设置 > 遥测设置”中打开 UDP 遥测：IP 127.0.0.1，端口 20700，格式 2025。
+没有游戏时，可以用开始菜单里的“F1 Race（虚拟比赛演示）”查看全部功能。
+
+系统要求：Windows 10 / 11（64 位）。头显仪表需要 SteamVR。
+
+程序不内置任何扫描地图：赛道地图由使用者在“赛道录制 / 赛道配准”页用自己的录像构建。
+
+程序包含以下第三方组件，按各自许可证使用：
+- Track N Race 赛道地图（各赛道走线、赛段、DRS 区，作者 NoGoat，https://github.com/NoGoat/Track-N-Race）—— GPL-3.0
+- Dear ImGui 1.91.9 —— MIT License
+- OpenVR 2.5.1（openvr_api.dll）—— BSD 3-Clause License，Valve Corporation
+- racetrack-database（赛道中心线与宽度，TUMFTM）—— GNU LGPL-3.0；原始数据来自 OpenStreetMap
+- f1-circuits（赛道中心线，Tomislav Bacinger）—— MIT License
+- 遥测包结构对照 f1-game-library-models-25 —— MIT License
+
+F1、Formula 1 及相关商标归其各自权利人所有；本程序与 EA、Codemasters、Formula One 集团无关。
+
+
+Qt 6（The Qt Company，LGPL-3.0）
+  程序界面使用 Qt 6.9（Qt Quick / QML），以动态链接库形式随程序分发（Qt6*.dll、qml 目录），可自行替换为兼容版本。
+  源码与许可：https://www.qt.io/download-open-source  ·  https://www.gnu.org/licenses/lgpl-3.0.html

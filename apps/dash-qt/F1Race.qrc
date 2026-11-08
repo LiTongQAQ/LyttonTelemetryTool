@@ -1,0 +1,32 @@
+<RCC>
+    <qresource>
+        <file>content/App.qml</file>
+        <file>content/DashboardPage.ui.qml</file>
+        <file>content/MainView.ui.qml</file>
+        <file>F1Race.qmlproject</file>
+        <file>imports/F1Data/qmldir</file>
+        <file>imports/F1Data/Race.qml</file>
+        <file>imports/F1Native/ImCanvas.qml</file>
+        <file>imports/F1Native/qmldir</file>
+        <file>imports/F1Native/TrackMap.qml</file>
+        <file>imports/F1Theme/qmldir</file>
+        <file>imports/F1Theme/Theme.qml</file>
+        <file>imports/F1Ui/ActionButton.qml</file>
+        <file>imports/F1Ui/CarCard.qml</file>
+        <file>imports/F1Ui/Card.qml</file>
+        <file>imports/F1Ui/Divider.qml</file>
+        <file>imports/F1Ui/EmptyState.qml</file>
+        <file>imports/F1Ui/MapView.qml</file>
+        <file>imports/F1Ui/PositionCell.qml</file>
+        <file>imports/F1Ui/qmldir</file>
+        <file>imports/F1Ui/SectorStrip.qml</file>
+        <file>imports/F1Ui/Sidebar.qml</file>
+        <file>imports/F1Ui/StandingsRow.qml</file>
+        <file>imports/F1Ui/StandingsTable.qml</file>
+        <file>imports/F1Ui/StatCard.qml</file>
+        <file>imports/F1Ui/TopBar.qml</file>
+        <file>imports/F1Ui/TyreBlock.qml</file>
+        <file>imports/F1Ui/TyreDot.qml</file>
+        <file>imports/F1Ui/TyresPanel.qml</file>
+    </qresource>
+</RCC>

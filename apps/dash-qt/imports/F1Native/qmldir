@@ -1,0 +1,3 @@
+module F1Native
+TrackMap 1.0 TrackMap.qml
+ImCanvas 1.0 ImCanvas.qml
