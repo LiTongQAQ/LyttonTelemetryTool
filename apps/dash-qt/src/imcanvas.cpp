@@ -259,6 +259,7 @@ void ImCanvas::frame()
         ImGuiIO &io = ImGui::GetIO();
         io.IniFilename = nullptr;
         io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset; // big lists (a zoomed map) split at 64k vertices, else 16-bit indices wrap and the rest of the frame is lost
         ui::setupStyle();
     }
     ImGui::SetCurrentContext(ctx_);
@@ -377,9 +378,12 @@ QSGNode *ImCanvas::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
             auto *clip = new QSGClipNode;
             clip->setIsRectangular(true);
             clip->setClipRect(QRectF(c.clip[0], c.clip[1], c.clip[2] - c.clip[0], c.clip[3] - c.clip[1]));
-            auto *geo = new QSGGeometry(imAttributes(), nv, int(c.idxCount), QSGGeometry::UnsignedShortType);
+            // this command's vertices: from its VtxOffset, at most 64k (its 16-bit indices count from there)
+            const int nvc = std::min(nv - int(c.vtxOffset), 65536);
+            if (nvc <= 0) { delete clip; continue; }
+            auto *geo = new QSGGeometry(imAttributes(), nvc, int(c.idxCount), QSGGeometry::UnsignedShortType);
             geo->setDrawingMode(QSGGeometry::DrawTriangles);
-            std::memcpy(geo->vertexData(), l.vtx.data(), l.vtx.size());
+            std::memcpy(geo->vertexData(), l.vtx.data() + size_t(c.vtxOffset) * sizeof(ImDrawVert), size_t(nvc) * sizeof(ImDrawVert));
             std::memcpy(geo->indexData(), l.idx.data() + c.idxOffset, c.idxCount * sizeof(unsigned short));
             auto *node = new QSGGeometryNode;
             node->setGeometry(geo);

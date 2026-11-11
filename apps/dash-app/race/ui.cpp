@@ -4,10 +4,14 @@
 
 #include "compare.hpp"
 #include "panels.hpp"
+#include "launcher.hpp"
+#include "wheelinput.hpp"
 #include "tracks.hpp"
 #include "carwire.hpp"
 #include "tyrecol.hpp"
 
+#include <cstring>
+#include <set>
 #include <imgui.h>
 #include <imgui_internal.h>
 
@@ -102,11 +106,12 @@ void tyreInfo(uint8_t visual, const char *&letter, ImU32 &col)
 }
 
 // ---- state -----------------------------------------------------------------------------------------------------
-enum Page { DASH, SETUP, CAPTURE, REPLAY, COMPARE, FORWARD, HMD, SETTINGS, PAGE_COUNT };
-const char *PAGE_NAMES[PAGE_COUNT] = {"Live Dash", "Car Setup", "Capture", "Replay", "Lap Compare", "Forwarding", "VR Panels", "Settings"};
+enum Page { DASH, SETUP, CAPTURE, REPLAY, COMPARE, FORWARD, HMD, SETTINGS, GAME, PAGE_COUNT }; // GAME last: page numbers of the others stay
+const char *PAGE_NAMES[PAGE_COUNT] = {"Live Dash", "Car Setup", "Capture", "Replay", "Lap Compare", "Forwarding", "VR Panels", "Settings", "Game"};
 const char *PAGE_HINTS[PAGE_COUNT] = {"Cars, standings and timing in the session", "Your car's setup, current settings and assists", "Choose the data source, check what arrives", "Recording library and replay controls",
                                       "Pick any two laps from recordings: lines, sectors and traces", "Send the telemetry on to other tools",
-                                      "Position and opacity of the panels in the headset", "Program options"};
+                                      "Position and opacity of the panels in the headset", "Program options",
+                                      "Start F1 25: online through Steam, or offline with mods through Swofty"};
 int g_page = DASH;
 bool g_dragSeek = false;
 uint64_t g_dragT = 0;     // where the dragged seek bar points, ns
@@ -274,6 +279,7 @@ Plot beginPlot(const char *id, float h, float x0, float x1, float y0, float y1, 
         ImVec2 ts = ImGui::CalcTextSize(b);
         if (i > 0 && i < hlines) p.dl->AddText(ImVec2(p.p0.x - ts.x - 6, y - ts.y / 2), alpha(C_DIM, 0.8f), b);
     }
+    if (!label || !*label) return p;
     ImVec2 ls = ImGui::CalcTextSize(label);
     p.dl->AddRectFilled(ImVec2(p.p0.x + 4, p.p0.y + 3), ImVec2(p.p0.x + ls.x + 14, p.p0.y + ls.y + 7), alpha(C_PANEL, 0.85f), 3);
     p.dl->AddText(ImVec2(p.p0.x + 9, p.p0.y + 5), C_DIM, label);
@@ -283,9 +289,23 @@ Plot beginPlot(const char *id, float h, float x0, float x1, float y0, float y1, 
 void plotLine(const Plot &p, const std::vector<ImVec2> &pts, ImU32 col, float th = 1.6f)
 {
     if (pts.size() < 2) return;
+    // only the visible x range (plus one point each side), at most ~2 points per pixel: a zoomed-in lap would
+    // otherwise send every sample of the whole lap, far outside the plot, and overflow the draw list
     std::vector<ImVec2> s;
-    s.reserve(pts.size());
-    for (auto &q : pts) s.push_back(p.map(q.x, std::clamp(q.y, p.y0 - (p.y1 - p.y0), p.y1 + (p.y1 - p.y0))));
+    s.reserve(std::min(pts.size(), size_t((p.p1.x - p.p0.x) * 2 + 8)));
+    const float lo = std::min(p.x0, p.x1), hi = std::max(p.x0, p.x1);
+    float lastX = -1e30f;
+    for (size_t i = 0; i < pts.size(); i++) {
+        const auto &q = pts[i];
+        const bool in = q.x >= lo && q.x <= hi;
+        const bool edge = (!in && i + 1 < pts.size() && q.x < lo && pts[i + 1].x >= lo) || (!in && i > 0 && q.x > hi && pts[i - 1].x <= hi);
+        if (!in && !edge) continue;
+        const ImVec2 m = p.map(q.x, std::clamp(q.y, p.y0 - (p.y1 - p.y0), p.y1 + (p.y1 - p.y0)));
+        if (in && m.x - lastX < 0.5f && i + 1 < pts.size()) continue;
+        s.push_back(m);
+        lastX = m.x;
+    }
+    if (s.size() < 2) return;
     p.dl->PushClipRect(p.p0, p.p1, true);
     p.dl->AddPolyline(s.data(), int(s.size()), col, ImDrawFlags_None, th);
     p.dl->PopClipRect();
@@ -331,8 +351,10 @@ void sidebar(app::App &a)
     dl->AddText(F->small, fsz(F->small), ImVec2(o.x + 56, o.y + 52), C_DIM, "Telemetry Tool v" F1RACE_VERSION);
     ImGui::Dummy(ImVec2(210, 92));
 
-    const char *groups[PAGE_COUNT] = {"RACE", nullptr, "DATA", nullptr, nullptr, "OUTPUT", nullptr, nullptr};
-    for (int i = 0; i < PAGE_COUNT; i++) {
+    // the order on the sidebar: the game launcher first, then the pages in their numbering
+    static const int ORDER[PAGE_COUNT] = {GAME, DASH, SETUP, CAPTURE, REPLAY, COMPARE, FORWARD, HMD, SETTINGS};
+    const char *groups[PAGE_COUNT] = {"RACE", nullptr, "DATA", nullptr, nullptr, "OUTPUT", nullptr, nullptr, "GAME"};
+    for (int i : ORDER) {
         if (groups[i]) {
             ImGui::SetCursorPosX(22);
             ImGui::Dummy(ImVec2(0, 4));
@@ -1462,16 +1484,18 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
     const Car *me = s.playerIdx < f1tel::MAX_CARS ? &s.cars[s.playerIdx] : nullptr;
 
     // sector state of the running lap, for colouring
+    // (after the line the finished lap's three stay a few seconds, then all reset together: timing::lapSectors)
     ImU32 secCol[3] = {C_DIM, C_DIM, C_DIM};
-    if (me)
+    std::array<timing::SectorCell, 3> cells{};
+    if (me) {
+        cells = timing::lapSectors(s, s.playerIdx);
         for (int k = 0; k < 3; k++) {
-            if (k < int(me->sector)) {
-                const uint32_t ms = k < 2 ? me->currentSectorMs[k] : 0;
-                secCol[k] = markColour(me->currentLapInvalid ? Mark::Invalid : markSector(s, s.playerIdx, k, ms, true));
-            } else {
-                secCol[k] = k == me->sector ? C_TEXT : alpha(C_DIM, 0.6f);
-            }
+            const auto st = cells[size_t(k)].state;
+            secCol[k] = st == timing::SectorCell::Done || st == timing::SectorCell::Held ? markColour(cells[size_t(k)].mark)
+                      : st == timing::SectorCell::Running                              ? C_TEXT
+                                                                                        : alpha(C_DIM, 0.6f);
         }
+    }
 
     const auto &geo = a.trackGeo;
     float liveDelta = 0;
@@ -1775,8 +1799,9 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
     if (g_mapFull && me) {
         const float rowH = stripH - 8, bw = 200;
         for (int k = 0; k < 3; k++) {
-            const uint32_t ms = k < 2 ? me->currentSectorMs[k] : 0;
-            const bool done = k < int(me->sector);
+            const uint32_t ms = cells[size_t(k)].ms;
+            const bool done = cells[size_t(k)].state == timing::SectorCell::Done || cells[size_t(k)].state == timing::SectorCell::Held;
+            const bool live = cells[size_t(k)].state == timing::SectorCell::Running;
             const float x = o0.x + k * (bw + 8), y = o0.y;
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x + bw, y + rowH), C_PANEL2, 5);
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 4, y + rowH), secCol[k], 2);
@@ -1790,8 +1815,8 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
                 dl->AddText(F->numMid, fsz(F->numMid) * 0.7f, ImVec2(x + 12, y + rowH - fsz(F->numMid) * 0.7f - 4),
                             secCol[k], formatSector(ms).c_str());
             else
-                dl->AddText(ImVec2(x + 12, y + rowH - 24), k == me->sector ? C_TEXT : C_DIM,
-                            k == me->sector ? "LIVE" : "--.---");
+                dl->AddText(ImVec2(x + 12, y + rowH - 24), live ? C_TEXT : C_DIM,
+                            live ? runningLabel(*me) : "--.---");
         }
         const auto &pl = s.player;
         ImGui::SetCursorScreenPos(ImVec2(o0.x + 3 * (bw + 8) + 10, o0.y + 2));
@@ -1825,10 +1850,13 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
     ImGui::BeginGroup();
     if (me && !g_mapFull) {
         ImVec2 q = ImGui::GetCursorScreenPos();
-        const float rowH = std::min(60.f, (mapH - 150) / 3 - 8);
+        // short card (small window or large UI scale): the rows shrink to a floor and the text under them drops out
+        const bool roomy = mapH >= 3 * (34 + 8) + 150;
+        const float rowH = std::clamp((mapH - (roomy ? 150 : 0)) / 3 - 8, 34.f, 60.f);
         for (int k = 0; k < 3; k++) {
-            const uint32_t ms = k < 2 ? me->currentSectorMs[k] : 0;
-            const bool done = k < int(me->sector);
+            const uint32_t ms = cells[size_t(k)].ms;
+            const bool done = cells[size_t(k)].state == timing::SectorCell::Done || cells[size_t(k)].state == timing::SectorCell::Held;
+            const bool live = cells[size_t(k)].state == timing::SectorCell::Running;
             const float y = q.y + k * (rowH + 8);
             dl->AddRectFilled(ImVec2(q.x, y), ImVec2(q.x + sideW, y + rowH), C_PANEL2, 5);
             dl->AddRectFilled(ImVec2(q.x, y), ImVec2(q.x + 4, y + rowH), secCol[k], 2);
@@ -1842,10 +1870,11 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
                 dl->AddText(F->numMid, fsz(F->numMid) * 0.8f, ImVec2(q.x + 12, y + rowH - fsz(F->numMid) * 0.8f - 5),
                             secCol[k], formatSector(ms).c_str());
             else
-                dl->AddText(ImVec2(q.x + 12, y + rowH - 25), k == me->sector ? C_TEXT : C_DIM,
-                            k == me->sector ? "LIVE" : "--.---");
+                dl->AddText(ImVec2(q.x + 12, y + rowH - 25), live ? C_TEXT : C_DIM,
+                            live ? runningLabel(*me) : "--.---");
         }
         ImGui::Dummy(ImVec2(sideW, 3 * (rowH + 8)));
+        if (roomy) {
         textCol(C_DIM, "DELTA TO BEST");
         ImGui::SameLine();
         withFont(F->num, [&] {
@@ -1861,6 +1890,7 @@ void mapCard(app::App &a, const Snapshot &s, float w, float h)
         textCol(pl.penaltiesS ? C_RED : C_TEXT, "Penalty %us", unsigned(pl.penaltiesS));
         ImGui::SameLine();
         textCol(me->currentLapInvalid ? C_RED : C_GREEN, me->currentLapInvalid ? "LAP INVALID" : "LAP VALID");
+        }
     }
     ImGui::EndGroup();
     endCard();
@@ -2599,7 +2629,16 @@ void cmpSectors(const cmp::File &fa, const cmp::File &fb, const cmp::Lap &A, con
 
 void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float w, float h)
 {
-    beginCard("cmpcharts", ImVec2(w, h)); // no scrolling: the wheel zooms the charts
+    // scrolls when the open charts don't fit; the wheel over a chart zooms it, so the mouse scroll is handled below
+    // (wheel over a header or gap, Shift+wheel anywhere, or the scrollbar)
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, v4(C_PANEL));
+    ImGui::PushStyleColor(ImGuiCol_Border, v4(C_BORDER));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 10));
+    ImGui::BeginChild("cmpcharts", ImVec2(w, h), ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
     const bool pos = g_align == 0;
     const float xa = pos ? A.trace.s.back().dist : A.trace.s.back().t - A.trace.s.front().t;
     const float xb = pos ? B.trace.s.back().dist : B.trace.s.back().t - B.trace.s.front().t;
@@ -2610,37 +2649,78 @@ void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float 
     const float v0 = g_cmpView0 * xmax, v1 = g_cmpView1 * xmax;
     float plotX0 = 0, plotW = 1; // screen span of the plots' data area, for the mouse
     (void)fa;
+    // y range: Fixed (natural bounds), Auto (the visible data, padded), Sym (symmetric around 0 over the visible data)
+    enum Range { Fixed, Auto, Sym };
     struct Ch {
         const char *name;
         Getter g;
         float y0, y1;
         const char *fmt;
+        Range range;
     };
     static const Ch chans[] = {
-        {"SPEED km/h", [](const Sample &x) { return x.speed; }, 0, 350, "%.0f"},
-        {"Throttle %", [](const Sample &x) { return x.throttle * 100; }, 0, 100, "%.0f"},
-        {"Brake %", [](const Sample &x) { return x.brake * 100; }, 0, 100, "%.0f"},
-        {"Gear", [](const Sample &x) { return float(x.gear); }, 0, 8, "%.0f"},
-        {"RPM", [](const Sample &x) { return x.rpm; }, 4000, 12500, "%.0f"},
-        {"STEER", [](const Sample &x) { return x.steer * 100; }, -100, 100, "%.0f"},
+        {"SPEED km/h", [](const Sample &x) { return x.speed; }, 0, 350, "%.0f", Auto},
+        {"Throttle %", [](const Sample &x) { return x.throttle * 100; }, 0, 100, "%.0f", Fixed},
+        {"Brake %", [](const Sample &x) { return x.brake * 100; }, 0, 100, "%.0f", Fixed},
+        {"Gear", [](const Sample &x) { return float(x.gear); }, 0, 8, "%.0f", Fixed},
+        {"RPM", [](const Sample &x) { return x.rpm; }, 4000, 12500, "%.0f", Auto},
+        {"STEER", [](const Sample &x) { return x.steer * 100; }, -100, 100, "%.0f", Sym},
+    };
+    constexpr int NCH = 7; // the six above and the delta
+    static bool fold[NCH] = {};
+    // folded charts keep a header row; the open ones share the rest of the height, but never below MIN_PH: then
+    // the card scrolls
+    const float headH = 20, MIN_PH = 120;
+    int open = 0;
+    for (bool f : fold) open += !f;
+    const float ph = open ? std::max(MIN_PH, (ImGui::GetWindowHeight() - 20 - NCH * (headH + 4) - open * 2.f) / float(open)) : MIN_PH;
+    auto header = [&](int i, const char *name) {
+        char b[64];
+        std::snprintf(b, sizeof b, "%s  %s##fold%d", fold[i] ? "+" : "-", name, i);
+        ImGui::PushStyleColor(ImGuiCol_Text, v4(C_DIM));
+        if (ImGui::Selectable(b, false, 0, ImVec2(0, headH - 4))) fold[i] = !fold[i];
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(fold[i] ? "Show chart" : "Fold chart");
+        return !fold[i];
+    };
+    auto rangeOf = [&](const std::vector<ImVec2> &a, const std::vector<ImVec2> *b, float &lo, float &hi) {
+        lo = 1e30f, hi = -1e30f;
+        for (const auto *v : {&a, b})
+            if (v)
+                for (const auto &q : *v)
+                    if (q.x >= v0 && q.x <= v1) { lo = std::min(lo, q.y); hi = std::max(hi, q.y); }
+        return lo <= hi;
     };
     // enough points for the zoomed window
     const int maxPts = int(ImGui::GetContentRegionAvail().x / std::max(0.02f, g_cmpView1 - g_cmpView0));
     bool anyHover = false;
-    const float ph = std::max(84.f, (ImGui::GetContentRegionAvail().y - 7 * 12.f) / 7);
     float hover = -1;
     auto cursorLine = [&](const Plot &p) {
         if (g_cmpCursor < 0) return;
         ImVec2 a0 = p.map(g_cmpCursor, p.y0), a1 = p.map(g_cmpCursor, p.y1);
         if (a0.x >= p.p0.x && a0.x <= p.p1.x) p.dl->AddLine(ImVec2(a0.x, a1.y), a0, alpha(C_TEXT, 0.5f));
     };
+    int ci = 0;
     for (const auto &ch : chans) {
-        Plot p = beginPlot(ch.name, ph, v0, v1, ch.y0, ch.y1, ch.name);
+        const int idx = ci++;
+        if (!header(idx, ch.name)) continue;
+        const auto pa = cmpPoints(A, ch.g, maxPts), pb = cmpPoints(B, ch.g, maxPts);
+        float y0 = ch.y0, y1 = ch.y1, lo, hi;
+        if (ch.range != Fixed && rangeOf(pa, &pb, lo, hi)) {
+            if (ch.range == Sym) {
+                const float m = std::max({std::fabs(lo), std::fabs(hi), 5.f}) * 1.1f;
+                y0 = -m, y1 = m;
+            } else {
+                const float pad = std::max((hi - lo) * 0.08f, 5.f);
+                y0 = lo - pad, y1 = hi + pad;
+            }
+        }
+        Plot p = beginPlot(ch.name, ph, v0, v1, y0, y1, "");
         plotX0 = p.p0.x;
         plotW = p.p1.x - p.p0.x;
         anyHover |= p.hovered;
-        plotLine(p, cmpPoints(B, ch.g, maxPts), alpha(C_LAP_B, 0.95f), 1.6f);
-        plotLine(p, cmpPoints(A, ch.g, maxPts), alpha(C_LAP_A, 0.95f), 1.6f);
+        plotLine(p, pb, alpha(C_LAP_B, 0.95f), 1.6f);
+        plotLine(p, pa, alpha(C_LAP_A, 0.95f), 1.6f);
         if (p.active) hover = std::clamp(p.unmapX(ImGui::GetIO().MousePos.x), v0, v1);
         cursorLine(p);
         if (g_cmpCursor >= 0) {
@@ -2658,7 +2738,7 @@ void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float 
         ImGui::Dummy(ImVec2(0, 2));
     }
     // delta: by position = time B - time A at the same distance; by time = metres A is ahead of B
-    {
+    if (header(NCH - 1, pos ? "Time delta s (B - A, positive = B slower)" : "Distance delta m (positive = A ahead)")) {
         std::vector<ImVec2> pts;
         float lo = pos ? -0.2f : -5.f, hi = -lo;
         const auto &s = B.trace.s;
@@ -2691,8 +2771,11 @@ void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float 
             }
             pts.swap(sm);
         }
-        const float m = std::max(std::fabs(lo), std::fabs(hi)) * 1.1f;
-        Plot p = beginPlot("cmpdelta", ph, v0, v1, -m, m, pos ? "Time delta s (B - A, positive = B slower)" : "Distance delta m (positive = A ahead)");
+        // symmetric around 0 over what is visible (after smoothing), so the line never leaves the chart
+        float wl, wh;
+        if (rangeOf(pts, nullptr, wl, wh)) lo = wl, hi = wh;
+        const float m = std::max({std::fabs(lo), std::fabs(hi), pos ? 0.05f : 1.f}) * 1.15f;
+        Plot p = beginPlot("cmpdelta", ph, v0, v1, -m, m, "");
         p.dl->AddLine(ImVec2(p.p0.x, p.map(0, 0).y), ImVec2(p.p1.x, p.map(0, 0).y), alpha(C_TEXT, 0.4f));
         anyHover |= p.hovered;
         plotLine(p, pts, C_YELLOW, 2.f);
@@ -2711,7 +2794,10 @@ void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float 
     {
         ImGuiIO &io = ImGui::GetIO();
         const float span = g_cmpView1 - g_cmpView0;
-        if (anyHover && io.MouseWheel != 0 && plotW > 1) {
+        const bool shift = io.KeyShift;
+        if (io.MouseWheel != 0 && ImGui::IsWindowHovered() && (shift || !anyHover))
+            ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseWheel * 80.f);
+        else if (anyHover && io.MouseWheel != 0 && plotW > 1) {
             const float mf = g_cmpView0 + std::clamp((io.MousePos.x - plotX0) / plotW, 0.f, 1.f) * span;
             const float ns = std::clamp(span * std::pow(0.8f, io.MouseWheel), 0.01f, 1.f);
             g_cmpView0 = mf - (mf - g_cmpView0) * ns / span;
@@ -2731,7 +2817,7 @@ void cmpCharts(const cmp::File &fa, const cmp::Lap &A, const cmp::Lap &B, float 
         if (g_cmpView1 > 1) { g_cmpView1 = 1; g_cmpView0 = 1 - sp; }
         if (anyHover && sp < 0.999f)
             ImGui::GetWindowDrawList()->AddText(ImVec2(plotX0 + 4, ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - ImGui::GetTextLineHeight() - 8),
-                                                alpha(C_DIM, 0.8f), "Wheel: zoom · Right drag: scroll · Double-click: whole lap");
+                                                alpha(C_DIM, 0.8f), "Wheel: zoom · Right drag: pan · Shift+wheel: scroll charts · Double-click: whole lap");
     }
 
     // pressing or dragging on a chart moves the playback position there
@@ -3409,6 +3495,344 @@ void pageHmd(app::App &a, VrEnv &env)
 }
 
 // ---- settings --------------------------------------------------------------------------------------------------------
+// ---- game launcher ---------------------------------------------------------------------------------------------
+// Online: Steam starts the stock game. Offline: Swofty's command line applies a profile's mods for the session.
+launcher::Launcher g_launch;
+
+// Wheel buttons: each plugin (the Lytton Dash mod, later the program itself) has its own controller; pick it, press
+// Bind, press the button (a rotary knob's click in each direction works too). Saved to wheel_buttons.ini at once;
+// the mod picks it up in the game within a second.
+wheel::Reader g_wheel;
+void wheelButtons()
+{
+    static bool loaded = false;
+    static wheel::Bindings all;
+    static std::string bindPlugin, bindAction; // the action waiting for a press
+    auto watchAll = [] {
+        std::set<std::string> g;
+        for (const auto &[id, b] : all)
+            if (!b.device.empty()) g.insert(b.device);
+        g_wheel.watch(g);
+    };
+    if (!loaded) {
+        all = wheel::load();
+        g_wheel.start();
+        watchAll();
+        loaded = true;
+    }
+    ImGui::Spacing();
+    ImGui::SeparatorText("WHEEL BUTTONS");
+    const auto devs = g_wheel.devices();
+    if (ImGui::SmallButton("Rescan controllers")) g_wheel.rescan();
+    ImGui::SameLine();
+    textCol(C_DIM, "%d connected", int(devs.size()));
+
+    if (!bindAction.empty()) {
+        const int got = g_wheel.captured();
+        if (got > 0) {
+            wheel::Binding &b = all[bindPlugin];
+            for (auto &[id, n] : b.button)
+                if (id != bindAction && n == got) n = 0; // one button, one action (within a plugin)
+            b.button[bindAction] = got;
+            wheel::save(all);
+            bindAction.clear();
+        } else if (!g_wheel.capturing()) bindAction.clear();
+    }
+
+    for (const auto &plug : wheel::plugins()) {
+        ImGui::PushID(plug.id);
+        wheel::Binding &b = all[plug.id];
+        const wheel::Device *cur = nullptr;
+        for (const auto &d : devs)
+            if (d.guid == b.device) cur = &d;
+        // not plugged in under its saved instance GUID: the same model under a new one counts as the same controller
+        if (!cur && !b.product.empty())
+            for (const auto &d : devs)
+                if (d.product == b.product) {
+                    cur = &d;
+                    b.device = d.guid;
+                    wheel::save(all);
+                    watchAll();
+                    break;
+                }
+        ImGui::Spacing();
+        textCol(C_TEXT, "%s", plug.title);
+        textCol(C_DIM, "Controller");
+        ImGui::SameLine(230);
+        ImGui::SetNextItemWidth(std::max(160.f, ImGui::GetContentRegionAvail().x));
+        const std::string label = cur ? cur->name : !b.deviceName.empty() ? b.deviceName + " (not connected)" : "Choose a controller";
+        if (ImGui::BeginCombo("##dev", label.c_str())) {
+            for (const auto &d : devs) {
+                char l[200];
+                std::snprintf(l, sizeof l, "%s  (%d buttons)##%s", d.name.c_str(), d.buttons, d.guid.c_str());
+                if (ImGui::Selectable(l, cur && d.guid == cur->guid)) {
+                    if (d.product != b.product) b.button.clear(); // another model: its buttons mean something else
+                    b.device = d.guid;
+                    b.product = d.product;
+                    b.deviceName = d.name;
+                    wheel::save(all);
+                    watchAll();
+                    if (bindPlugin == plug.id) { bindAction.clear(); g_wheel.cancelCapture(); }
+                }
+            }
+            if (devs.empty()) textCol(C_DIM, "No game controllers found");
+            ImGui::EndCombo();
+        }
+        const auto held = cur ? g_wheel.pressed(cur->guid) : std::vector<int>{};
+        ImGui::BeginDisabled(!cur);
+        for (const auto &act : wheel::actions()) {
+            if (std::strcmp(act.plugin, plug.id) != 0) continue;
+            ImGui::PushID(act.id);
+            const bool waiting = bindPlugin == plug.id && bindAction == act.id;
+            const int n = b.get(act.id);
+            textCol(C_DIM, "%s", act.label);
+            ImGui::SameLine(230);
+            const bool on = n > 0 && std::find(held.begin(), held.end(), n) != held.end();
+            if (waiting) textCol(C_YELLOW, "Press a button...");
+            else if (n > 0) textCol(on ? C_GREEN : C_TEXT, "Button %d", n);
+            else textCol(C_DIM, "not bound");
+            ImGui::SameLine(400);
+            if (waiting) {
+                if (ImGui::SmallButton("Cancel")) { bindAction.clear(); g_wheel.cancelCapture(); }
+            } else if (ImGui::SmallButton("Bind")) {
+                bindPlugin = plug.id;
+                bindAction = act.id;
+                g_wheel.capture(cur->guid);
+            }
+            if (n > 0 && !waiting) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear")) { b.button.erase(act.id); wheel::save(all); }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndDisabled();
+        if (cur) {
+            std::string h;
+            for (int x : held) h += (h.empty() ? "" : ", ") + std::to_string(x);
+            textCol(C_DIM, "Held now: %s", h.empty() ? "-" : h.c_str());
+        }
+        ImGui::PopID();
+    }
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, v4(C_DIM));
+    ImGui::TextWrapped("Each plugin reads its own controller (a knob turned left and right can be two actions). The game "
+                       "still gets the button too: pick one it does not use, or one you want for both. The Lytton Dash "
+                       "mod runs only in offline sessions.");
+    ImGui::PopStyleColor();
+}
+
+void pageGame(app::App &a)
+{
+    static bool first = true;
+    if (first) {
+        g_launch.refresh(a.cfg.launchProfile);
+        first = false;
+    }
+    const launcher::Status st = g_launch.status();
+    const bool busy = g_launch.busy();
+    const std::string profile = !a.cfg.launchProfile.empty() ? a.cfg.launchProfile : st.activeProfile;
+    const float W = ImGui::GetContentRegionAvail().x, H = ImGui::GetContentRegionAvail().y, gap = 12;
+    const float leftW = std::floor((W - gap) * 0.58f), rightW = W - gap - leftW;
+    const bool mods = a.cfg.launchMods;
+
+    // two-way choice as a pair of buttons, the chosen one filled
+    auto choice = [&](const char *id, bool &value, const char *offLabel, const char *onLabel, ImU32 onCol) {
+        ImGui::PushID(id);
+        const float bw = 250, y = ImGui::GetCursorPosY();
+        for (int k = 0; k < 2; k++) {
+            if (k) {
+                ImGui::SameLine(0, 6);
+                ImGui::SetCursorPosY(y); // the label beside the row sits lower: keep both buttons level
+            }
+            const bool sel = value == (k == 1);
+            ImGui::PushStyleColor(ImGuiCol_Button, v4(sel ? (k ? onCol : C_PANEL2) : C_PANEL));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, v4(sel ? (k ? onCol : C_PANEL2) : alpha(C_PANEL2, 0.7f)));
+            ImGui::PushStyleColor(ImGuiCol_Text, v4(sel ? C_TEXT : C_DIM));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, sel ? 0.f : 1.f);
+            if (ImGui::Button(k ? onLabel : offLabel, ImVec2(bw, 40)) && value != (k == 1)) {
+                value = k == 1;
+                a.dirty = true;
+            }
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+        }
+        ImGui::PopID();
+    };
+    auto label = [](const char *t) { // level with the 40 px choice buttons beside it
+        const float y = ImGui::GetCursorPosY();
+        ImGui::SetCursorPosY(y + (40 - ImGui::GetTextLineHeight()) / 2);
+        textCol(C_DIM, "%s", t);
+        ImGui::SameLine(120);
+        ImGui::SetCursorPosY(y);
+    };
+
+    // ---- left: what to start, and the button ----
+    beginCard("launch", ImVec2(leftW, H), "LAUNCH OPTIONS");
+    label("Display");
+    choice("vr", a.cfg.launchVr, "Monitor", "VR headset (SteamVR)", C_BLUE);
+    ImGui::Spacing();
+    label("Mods");
+    choice("mods", a.cfg.launchMods, "No mods  (online OK)", "Load mods  (offline)", C_ACCENT);
+    ImGui::Spacing();
+
+    int enabledCount = 0;
+    if (mods) {
+        if (!st.found) {
+            textCol(C_YELLOW, "Swofty Launcher not found: install it from f1.swofty.net (it loads the mods), then Refresh.");
+        } else {
+            label("Profile");
+            ImGui::SetNextItemWidth(300);
+            if (ImGui::BeginCombo("##profile", profile.c_str())) {
+                for (const auto &pr : st.profiles) {
+                    const std::string l = pr + (pr == st.activeProfile ? "  (Swofty's current)" : "");
+                    if (ImGui::Selectable(l.c_str(), pr == profile)) {
+                        a.cfg.launchProfile = pr;
+                        a.dirty = true;
+                        g_launch.refresh(pr);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::Spacing();
+            textCol(C_DIM, "Which mods to load");
+            if (st.addonsProfile != profile) textCol(C_DIM, "Loading...");
+            else if (st.addons.empty()) textCol(C_DIM, "This profile has no addons");
+            else if (ImGui::BeginTable("addons", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 40);
+                ImGui::TableSetupColumn("Addon", ImGuiTableColumnFlags_WidthStretch, 3);
+                ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthStretch, 1);
+                for (const auto &ad : st.addons) {
+                    if (ad.shader()) continue; // chosen below, as the profile's shader config
+                    if (ad.enabled() && !ad.builtIn()) enabledCount++;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    bool on = ad.enabled();
+                    ImGui::BeginDisabled(ad.builtIn() || busy || profile == "vanilla");
+                    ImGui::PushID(ad.id.c_str());
+                    if (ImGui::Checkbox("##on", &on)) g_launch.setAddon(profile, ad.id, on);
+                    ImGui::PopID();
+                    ImGui::EndDisabled();
+                    ImGui::TableNextColumn();
+                    textCol(C_TEXT, "%s", ad.name.c_str());
+                    ImGui::SameLine();
+                    textCol(C_DIM, "%s", ad.id.c_str());
+                    ImGui::TableNextColumn();
+                    textCol(C_DIM, "%s%s", ad.version.c_str(), ad.builtIn() ? "  (always on)" : "");
+                }
+                ImGui::EndTable();
+            }
+            // the profile's shader config (colour grading and post effects), one at a time
+            if (st.addonsProfile == profile) {
+                ImGui::Spacing();
+                label("Shaders");
+                std::string cur = "Off";
+                for (const auto &sh : st.shaders)
+                    if (sh.id == st.activeShader) cur = sh.name;
+                ImGui::SetNextItemWidth(300);
+                ImGui::BeginDisabled(busy || profile == "vanilla");
+                if (ImGui::BeginCombo("##shader", cur.c_str())) {
+                    if (ImGui::Selectable("Off", st.activeShader == "off" || st.activeShader.empty())) g_launch.setShader(profile, "off");
+                    for (const auto &sh : st.shaders)
+                        if (ImGui::Selectable(sh.name.c_str(), sh.id == st.activeShader)) g_launch.setShader(profile, sh.id);
+                    ImGui::EndCombo();
+                }
+                ImGui::EndDisabled();
+                ImGui::Dummy(ImVec2(0, 4));
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, v4(C_DIM));
+            ImGui::TextWrapped("New addons, content mods and profiles are added in Swofty Launcher.");
+            ImGui::PopStyleColor();
+            if (st.checked && !(st.consent && st.extension))
+                textCol(C_YELLOW, "First time: open Swofty Launcher and press Play once (accept its offline terms).");
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, v4(C_DIM));
+        ImGui::TextWrapped("The stock game through Steam: EA AntiCheat on, online races and two-player career work.");
+        ImGui::PopStyleColor();
+        if (st.found && st.checked && !st.vanilla)
+            textCol(C_YELLOW, "The game files were left changed by a modded session: Restore them first (right).");
+    }
+
+    // the button, at the bottom of the card, saying what it will do
+    const float btnH = 96;
+    ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY() + 12, ImGui::GetWindowHeight() - btnH - 44));
+    {
+        char title[96], sub[160];
+        std::snprintf(title, sizeof title, "PLAY  %s%s", mods ? "OFFLINE + MODS" : "ONLINE", a.cfg.launchVr ? "  ·  VR" : "");
+        if (mods)
+            std::snprintf(sub, sizeof sub, "Swofty, profile %s, %d mod%s on; single-player only, EA AntiCheat off for the session",
+                          profile.empty() ? "-" : profile.c_str(), enabledCount, enabledCount == 1 ? "" : "s");
+        else std::snprintf(sub, sizeof sub, "Steam, stock game; EA AntiCheat on, multiplayer");
+        const bool can = !busy && (!mods || (st.found && !profile.empty()));
+        const ImU32 col = mods ? C_ACCENT : C_GREEN;
+        ImGui::BeginDisabled(!can);
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float bw = ImGui::GetContentRegionAvail().x;
+        const bool hit = ImGui::InvisibleButton("play", ImVec2(bw, btnH));
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + bw, p.y + btnH), alpha(col, !can ? 0.25f : ImGui::IsItemHovered() ? 0.95f : 0.8f), 8);
+        dl->AddText(F->numMid, fsz(F->numMid), ImVec2(p.x + 22, p.y + 14), IM_COL32_WHITE, title);
+        dl->AddText(ImVec2(p.x + 22, p.y + btnH - 30), alpha(IM_COL32_WHITE, 0.85f), sub);
+        ImGui::EndDisabled();
+        if (hit) {
+            if (mods) g_launch.playOffline(profile, a.cfg.launchVr);
+            else g_launch.playOnline(a.cfg.launchVr);
+        }
+        if (busy) textCol(C_DIM, "Working...");
+        else textCol(C_TEXT, "%s", g_launch.message().c_str());
+    }
+    endCard();
+
+    // ---- right: Swofty and the game files ----
+    ImGui::SameLine(0, gap);
+    beginScrollCard("swofty", ImVec2(rightW, H), "GAME AND SWOFTY");
+    if (!st.checked) textCol(C_DIM, "Checking...");
+    else {
+        auto row = [](const char *k) {
+            textCol(C_DIM, "%s", k);
+            ImGui::SameLine(130);
+        };
+        if (!st.found) {
+            row("Swofty");
+            textCol(C_YELLOW, "not installed (only needed for mods)");
+        } else {
+            row("Swofty");
+            textCol(C_TEXT, "%s", st.version.c_str());
+            row("Game");
+            textCol(C_TEXT, "build %s", st.gameBuild.c_str());
+            row("Folder");
+            textCol(C_DIM, "%s", st.gameDir.c_str());
+            row("Game files");
+            if (st.vanilla) textCol(C_GREEN, "Stock: fine for online");
+            else {
+                textCol(C_YELLOW, "Changed by a modded session");
+                ImGui::SameLine();
+                ImGui::BeginDisabled(busy || st.gameRunning);
+                if (ImGui::SmallButton("Restore")) g_launch.restore();
+                ImGui::EndDisabled();
+            }
+            row("Offline mods");
+            if (st.consent && st.extension) textCol(C_GREEN, "Ready");
+            else textCol(C_YELLOW, "One-time setup in Swofty Launcher");
+        }
+        if (st.gameRunning) textCol(C_ORANGE, "F1 25 is running");
+        ImGui::Spacing();
+        if (st.found && ImGui::Button("Open Swofty Launcher")) g_launch.openSwofty();
+        if (st.found) ImGui::SameLine();
+    }
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Refresh")) g_launch.refresh(a.cfg.launchProfile);
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, v4(C_DIM));
+    ImGui::TextWrapped("Mods load only in sessions started offline through Swofty: it turns EA AntiCheat off for that "
+                       "session and puts the game files back when the game exits. Telemetry and the headset panels work "
+                       "in both modes.");
+    ImGui::PopStyleColor();
+    wheelButtons();
+    endCard();
+}
+
 void pageSettings(app::App &a)
 {
     beginScrollCard("set", ImVec2(std::min(760.f, ImGui::GetContentRegionAvail().x), ImGui::GetContentRegionAvail().y), nullptr);
@@ -3516,6 +3940,7 @@ void drawPage(app::App &a, VrEnv &vr, int p)
     case FORWARD: pageForward(a); break;
     case HMD: pageHmd(a, vr); break;
     case SETTINGS: pageSettings(a); break;
+    case GAME: pageGame(a); break;
     }
 }
 bool drawEmpty(app::App &a, const Snapshot &s) { return emptyState(a, s); }

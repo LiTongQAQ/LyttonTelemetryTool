@@ -46,6 +46,7 @@ struct Car {
     uint32_t gapToCarAheadMs = 0;
     uint32_t gapToLeaderMs = 0;
     uint8_t pitStatus = 0;    // 0 none, 1 pitting, 2 in pit area
+    uint8_t driverStatus = 4; // the game's: 0 garage, 1 flying lap, 2 in lap, 3 out lap, 4 on track
     uint8_t resultStatus = 0; // 2 active, 3 finished, 4 DNF, ...
     float lapDistance = 0;    // metres into the lap
     float worldX = 0, worldZ = 0; // Motion: position on the ground plane
@@ -264,6 +265,20 @@ std::string playerCode(const std::string &name); // first Latin word: first lett
 enum class Mark { None, SessionBest, PersonalBest, Slower, Invalid };
 Mark markSector(const Snapshot &s, int car, int sector, uint32_t ms, bool valid);
 Mark markLap(const Snapshot &s, int car, uint32_t ms, bool valid);
+
+// The three sector cells of a car's running lap, the same on every screen: completed sectors coloured, the one being
+// driven Running, the rest Todo (empty). For holdMs after the line the finished lap's three sectors stay (Held),
+// then all three reset together.
+struct SectorCell {
+    enum State { Todo, Running, Done, Held } state = Todo;
+    uint32_t ms = 0;
+    Mark mark = Mark::None;
+};
+constexpr uint32_t SECTOR_HOLD_MS = 4000;
+std::array<SectorCell, 3> lapSectors(const Snapshot &s, int car, uint32_t holdMs = SECTOR_HOLD_MS);
+// What the sector being driven shows instead of a time: "PIT" in the pit lane or garage (the game's lap clock keeps
+// running there, so no time), "IN LAP" / "OUT LAP" from the game's driver status, else "LIVE".
+const char *runningLabel(const Car &c);
 
 class RaceState {
 public:

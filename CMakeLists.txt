@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.21)
-project(F1_25_Mods4Lytton VERSION 0.2.3 LANGUAGES CXX)
+project(F1_25_Mods4Lytton VERSION 0.2.6 LANGUAGES CXX)
 
 # 软件版本（apps/README.md 里记录每个版本的变化）
-set(F1RACE_VERSION ${PROJECT_VERSION})
+# 预发布后缀（如 -beta）：CMake 的版本号只能是数字，后缀单独写；正式版留空
+set(F1RACE_VERSION_SUFFIX "")
+set(F1RACE_VERSION ${PROJECT_VERSION}${F1RACE_VERSION_SUFFIX})
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,9 +74,10 @@ target_link_libraries(imgui PUBLIC d3d11 d3dcompiler dxgi dwmapi imm32 gdi32)
 
 # ---- race core: HMD panels, SteamVR, layout, sources / settings (shared by both desktop programs) ----
 add_library(race_core STATIC apps/dash-app/race/panels.cpp apps/dash-app/race/carwire.cpp apps/dash-app/race/vr_overlay.cpp
-  apps/dash-app/race/layout.cpp apps/dash-app/race/app.cpp apps/dash-app/race/compare.cpp apps/dash-app/race/log.cpp)
+  apps/dash-app/race/layout.cpp apps/dash-app/race/app.cpp apps/dash-app/race/compare.cpp apps/dash-app/race/log.cpp
+  apps/dash-app/race/launcher.cpp apps/dash-app/race/wheelinput.cpp)
 target_include_directories(race_core PUBLIC apps/dash-app/race third_party/openvr/headers)
-target_link_libraries(race_core PUBLIC f1hub_lib timing f1sim tracks imgui shell32 comdlg32)
+target_link_libraries(race_core PUBLIC f1hub_lib timing f1sim tracks imgui shell32 comdlg32 dinput8 dxguid)
 target_compile_definitions(race_core PUBLIC F1RACE_VERSION="${F1RACE_VERSION}")
 
 # ---- f1-race: the ImGui desktop window (being replaced by the Qt one below) ----

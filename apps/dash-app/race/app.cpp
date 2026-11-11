@@ -29,6 +29,7 @@ void saveSettings(const Settings &s, const std::string &path)
          "# <panel>.place = left-right(deg) up-down(deg) fore-aft(m, negative = farther) yaw(deg) pitch(deg) scale(x)\n"
          "# hmd.* = headset values by hand, 0 = what SteamVR reports; hmd.viewH/viewV = usable view the panels hug (deg)\n"
       << "port=" << s.port << "\nstartSource=" << s.startSource << "\nsimSpeed=" << s.simSpeed
+      << "\nlaunch.profile=" << s.launchProfile << "\nlaunch.vr=" << s.launchVr << "\nlaunch.mods=" << s.launchMods
       << "\nmyCode=" << s.myCode << "\nlatinFont=" << s.latinFont << "\nlatinDigits=" << s.latinDigits << "\ngapMode=" << s.gapMode << "\nbgOpacity=" << s.bgOpacity
       << "\ntextOpacity=" << s.textOpacity << "\nhmd.renderW=" << s.hmd.renderW << "\nhmd.renderH=" << s.hmd.renderH
       << "\nhmd.fovH=" << s.hmd.fovH << "\nhmd.fovV=" << s.hmd.fovV << "\nhmd.viewH=" << s.hmd.viewH
@@ -93,6 +94,9 @@ Settings loadSettings(const std::string &path)
         else if (k == "startSource") s.startSource = std::clamp(std::atoi(v.c_str()), 0, 1);
         else if (k == "simSpeed") s.simSpeed = std::clamp(num(), 0.25f, 8.f);
         else if (k == "myCode") s.myCode = v.substr(0, 4);
+        else if (k == "launch.profile") s.launchProfile = v;
+        else if (k == "launch.vr") s.launchVr = v == "1";
+        else if (k == "launch.mods") s.launchMods = v == "1";
         else if (k == "latinFont") s.latinFont = v;
         else if (k == "latinDigits") s.latinDigits = v != "0";
         else if (k == "gapMode") s.gapMode = std::clamp(std::atoi(v.c_str()), 0, 2);

@@ -86,6 +86,41 @@ Mark markSector(const Snapshot &s, int car, int sector, uint32_t ms, bool valid)
     return mark(ms, valid, s.sessionBestSectorMs[sector], s.cars[car].bestSectorMs[sector]);
 }
 
+std::array<SectorCell, 3> lapSectors(const Snapshot &s, int car, uint32_t holdMs)
+{
+    std::array<SectorCell, 3> out{};
+    if (car < 0 || car >= int(s.cars.size())) return out;
+    const Car &c = s.cars[size_t(car)];
+    if (c.sector == 0 && c.currentLapMs < holdMs && !c.laps.empty() && c.laps.back().lapMs) {
+        const LapRecord &l = c.laps.back();
+        for (int k = 0; k < 3; k++) {
+            out[size_t(k)].state = SectorCell::Held;
+            out[size_t(k)].ms = l.sectorMs[size_t(k)];
+            out[size_t(k)].mark = markSector(s, car, k, l.sectorMs[size_t(k)], l.lapValid && l.sectorValid[size_t(k)]);
+        }
+        return out;
+    }
+    for (int k = 0; k < 3; k++) {
+        SectorCell &o = out[size_t(k)];
+        if (k < int(c.sector) && k < 2) {
+            o.state = SectorCell::Done;
+            o.ms = c.currentSectorMs[size_t(k)];
+            o.mark = markSector(s, car, k, o.ms, !c.currentLapInvalid);
+        } else if (k == int(c.sector)) {
+            o.state = SectorCell::Running;
+        }
+    }
+    return out;
+}
+
+const char *runningLabel(const Car &c)
+{
+    if (c.pitStatus != 0 || c.driverStatus == 0) return "PIT";
+    if (c.driverStatus == 2) return "IN LAP";
+    if (c.driverStatus == 3) return "OUT LAP";
+    return "LIVE";
+}
+
 Mark markLap(const Snapshot &s, int car, uint32_t ms, bool valid)
 {
     return mark(ms, valid, s.sessionBestLapMs, s.cars[car].bestLapMs);
@@ -259,6 +294,7 @@ void RaceState::feed(const uint8_t *data, size_t len)
             c.gapToCarAheadMs = split_ms(d.deltaToCarInFrontMinutesPart, d.deltaToCarInFrontMSPart);
             c.gapToLeaderMs = split_ms(d.deltaToRaceLeaderMinutesPart, d.deltaToRaceLeaderMSPart);
             c.pitStatus = d.pitStatus;
+            c.driverStatus = d.driverStatus;
             c.resultStatus = d.resultStatus;
             c.lapDistance = d.lapDistance;
             c.numPitStops = d.numPitStops;

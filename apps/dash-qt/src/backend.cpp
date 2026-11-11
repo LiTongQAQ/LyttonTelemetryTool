@@ -210,26 +210,20 @@ void Backend::refresh()
     bestLapColor_ = me && me->bestLapMs && me->bestLapMs == s.sessionBestLapMs ? C_PURPLE : C_GREEN;
     sessionBest_ = q(formatLap(s.sessionBestLapMs));
 
-    // sectors: the running lap's completed sectors, the rest from the last lap (dimmed)
+    // sectors: the running lap's completed sectors; after the line the finished lap's three stay a few seconds,
+    // then all three reset together (timing::lapSectors)
     sectors_.clear();
+    std::array<timing::SectorCell, 3> cells{};
+    if (me) cells = lapSectors(s, s.playerIdx);
     for (int k = 0; k < 3; k++) {
         QVariantMap m;
         m["label"] = QString("S%1").arg(k + 1);
-        uint32_t ms = 0;
-        bool done = false;
-        QColor col = C_DIM;
-        if (me) {
-            if (k < me->sector && k < 2) {
-                ms = me->currentSectorMs[size_t(k)];
-                done = true;
-                col = markColour(markSector(s, s.playerIdx, k, ms, !me->currentLapInvalid));
-            } else if (!me->laps.empty()) {
-                const auto &l = me->laps.back();
-                ms = l.sectorMs[size_t(k)];
-                col = C_DIM;
-            }
-        }
-        m["time"] = ms ? q(formatSector(ms)) : QString("-");
+        const auto &cell = cells[size_t(k)];
+        const bool done = cell.state == timing::SectorCell::Done || cell.state == timing::SectorCell::Held;
+        const uint32_t ms = done ? cell.ms : 0;
+        const QColor col = done ? markColour(cell.mark) : C_DIM;
+        const bool running = cell.state == timing::SectorCell::Running;
+        m["time"] = running && me ? QString(runningLabel(*me)) : ms ? q(formatSector(ms)) : QString("-");
         m["color"] = col;
         m["done"] = done;
         sectors_.push_back(m);

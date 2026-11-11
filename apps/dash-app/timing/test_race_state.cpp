@@ -101,6 +101,36 @@ int main()
     CHECK(markSector(s, 19, 0, 30800, false) == Mark::Invalid);
     CHECK(markLap(s, 0, 95000, true) == Mark::SessionBest);
 
+    // Sector cells: just after the line the finished lap's three are held, later all three reset together.
+    {
+        timing::Snapshot t = s;
+        auto &c = t.cars[19];
+        c.sector = 0;
+        c.currentLapMs = 1500;
+        auto cells = lapSectors(t, 19);
+        CHECK(cells[0].state == SectorCell::Held && cells[2].state == SectorCell::Held);
+        CHECK(cells[1].ms == 40500 && cells[1].mark == Mark::PersonalBest);
+        c.currentLapMs = SECTOR_HOLD_MS + 1;
+        cells = lapSectors(t, 19);
+        CHECK(cells[0].state == SectorCell::Running && cells[1].state == SectorCell::Todo && cells[2].state == SectorCell::Todo);
+        CHECK(cells[1].ms == 0 && cells[2].ms == 0);
+        c.sector = 1;
+        c.currentLapMs = 31000;
+        c.currentSectorMs[0] = 30200;
+        cells = lapSectors(t, 19);
+        CHECK(cells[0].state == SectorCell::Done && cells[0].ms == 30200 && cells[0].mark == Mark::PersonalBest);
+        CHECK(cells[1].state == SectorCell::Running && cells[2].state == SectorCell::Todo);
+        // in / out laps and the pit lane, from the game's driver and pit status
+        CHECK(std::string(runningLabel(c)) == "LIVE");
+        c.driverStatus = 2;
+        CHECK(std::string(runningLabel(c)) == "IN LAP");
+        c.pitStatus = 1;
+        CHECK(std::string(runningLabel(c)) == "PIT");
+        c.pitStatus = 0;
+        c.driverStatus = 3;
+        CHECK(std::string(runningLabel(c)) == "OUT LAP");
+    }
+
     // Invalid sectors don't set the session best.
     feed(rs, history(hist, 5, {{29000, 39000, 24000}}, 0x2 | 0x1));
     s = rs.snapshot();

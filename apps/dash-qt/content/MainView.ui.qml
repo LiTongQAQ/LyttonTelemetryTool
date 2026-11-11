@@ -105,6 +105,12 @@ Rectangle {
                     pageIndex: 7
                     visible: Race.page === 7
                 }
+                ImCanvas {
+                    anchors.fill: parent
+                    piece: "page"
+                    pageIndex: 8
+                    visible: Race.page === 8
+                }
             }
         }
 

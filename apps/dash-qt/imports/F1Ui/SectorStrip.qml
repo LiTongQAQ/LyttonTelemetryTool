@@ -3,7 +3,7 @@ import QtQuick.Layouts
 import F1Theme
 import F1Data
 
-// 本圈三个赛段：已完成的按紫 / 绿 / 黄着色，未完成的显示上一圈（灰）。
+// 本圈三个赛段：已完成的按紫 / 绿 / 黄着色，未完成的留空；冲线后上一圈三段保持几秒再一起重置。
 // vertical 勾上变竖排（地图旁边），默认横排。
 GridLayout {
     id: sectorStrip

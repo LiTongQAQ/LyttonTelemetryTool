@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ISCC="${ISCC:-/c/Program Files (x86)/Inno Setup 6/ISCC.exe}"
-version=$(sed -nE 's/^project\(F1_25_Mods4Lytton VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+version=$(sed -nE 's/^project\(F1_25_Mods4Lytton VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)$(sed -nE 's/^set\(F1RACE_VERSION_SUFFIX "([^"]*)"\).*/\1/p' CMakeLists.txt)
 for f in build-qt/app/LyttonTelemetryTool.exe build-qt/app/openvr_api.dll build/f1-race.exe; do
   [ -f "$f" ] || { echo "missing $f: build first" >&2; exit 1; }
 done

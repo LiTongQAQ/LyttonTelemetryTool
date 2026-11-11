@@ -238,23 +238,20 @@ void sectors(ImDrawList *dl, const Snapshot &s, const Fonts &f)
     // three sector boxes for the running lap, then the last completed lap below
     const float bx = r.x + 20, bw = (r.w - 40 - 2 * 12) / 3, by = r.y + 76;
     const timing::LapRecord *last = c.laps.empty() ? nullptr : &c.laps.back();
+    // completed sectors coloured; after the line the finished lap stays a few seconds, then all three reset
+    const auto cells = timing::lapSectors(s, p);
     for (int k = 0; k < 3; k++) {
         const float x = bx + float(k) * (bw + 12);
-        uint32_t ms = 0;
-        bool valid = !c.currentLapInvalid;
-        bool running = k == c.sector;
-        if (k < 2 && k < c.sector) ms = c.currentSectorMs[k];
-        // before a sector is done this lap, show the last lap's time dimmed
-        bool fromLast = false;
-        if (!ms && !running && last) { ms = last->sectorMs[k]; valid = last->sectorValid[k]; fromLast = true; }
-        Mark m = timing::markSector(s, p, k, ms, valid);
-        ImU32 col = markColour(m);
+        const auto &cell = cells[size_t(k)];
+        const bool running = cell.state == timing::SectorCell::Running;
+        const bool shown = cell.state == timing::SectorCell::Done || cell.state == timing::SectorCell::Held;
+        const ImU32 col = shown ? markColour(cell.mark) : LINE;
         dl->AddRectFilled(ImVec2(x, by), ImVec2(x + bw, by + 8), running ? WHITE : col, 3.f);
         char lbl[8];
         std::snprintf(lbl, sizeof lbl, "S%d", k + 1);
         text(dl, f.small, x, by + 18, DIM, lbl);
-        textRight(dl, f.body, x + bw, by + 46, fromLast ? DIM : (ms ? col : DIM),
-                  running ? "..." : timing::formatSector(ms).c_str());
+        textRight(dl, f.body, x + bw, by + 46, shown && cell.ms ? col : DIM,
+                  running ? timing::runningLabel(c) : shown ? timing::formatSector(cell.ms).c_str() : "--.---");
         // personal best for the sector, small
         char best[24];
         std::snprintf(best, sizeof best, "PB %s", timing::formatSector(c.bestSectorMs[k]).c_str());

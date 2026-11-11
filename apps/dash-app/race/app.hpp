@@ -31,6 +31,9 @@ struct Settings {
     float textOpacity = 1.0f;
     std::string latinFont; // font file for the Latin letters, empty = the built-in choice (takes effect on restart)
     bool latinDigits = true; // the digits from latinFont too
+    std::string launchProfile; // Swofty profile for "play offline", empty = Swofty's active one
+    bool launchVr = false;     // start F1 25 in VR (Steam's VR launch / swofty run --vr)
+    bool launchMods = false;   // load mods: offline through Swofty (else the stock game through Steam)
     std::string myCode; // your driver code in the standings (timing::setMyCode), empty = from the name
     layout::Offset offset[layout::PANELS];
     layout::Overrides hmd;
